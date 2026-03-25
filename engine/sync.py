@@ -34,9 +34,38 @@ def get_garmin_client():
             Path(__file__).resolve().parents[3]
             / "skills" / "garmin-cycling-coach" / "state" / "tokens"
         )
+        
+    # Check if Garmin China (garmin.cn) should be used
+    is_cn_env = os.environ.get("GARMIN_IS_CN", "false").lower() in ("true", "1", "yes")
 
-    api = Garmin()
-    api.login(token_dir)
+    email = os.environ.get("GARMIN_EMAIL")
+    password = os.environ.get("GARMIN_PASSWORD")
+
+    api = Garmin(is_cn=is_cn_env)
+    try:
+        api.login(token_dir)
+    except Exception as e:
+        if email and password:
+            print(f"Garmin token login failed ({e}). Retrying with credentials...")
+            api = Garmin(email=email, password=password, is_cn=is_cn_env)
+            
+            # Temporarily clear GARMINTOKENS env var to prevent implicit loading of bad tokens
+            original_env_token = os.environ.pop("GARMINTOKENS", None)
+            try:
+                # Login without tokenstore forces username/password authentication
+                api.login()
+                
+                # Save newly acquired tokens to token_dir
+                token_path = Path(token_dir)
+                token_path.mkdir(parents=True, exist_ok=True)
+                api.garth.dump(str(token_path))
+                print(f"Successfully saved new Garmin tokens to {token_dir}")
+            finally:
+                if original_env_token is not None:
+                    os.environ["GARMINTOKENS"] = original_env_token
+        else:
+            raise
+
     return api
 
 

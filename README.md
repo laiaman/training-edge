@@ -95,7 +95,10 @@ Copy `.env.example` to `.env`:
 | `TRAININGEDGE_MAX_HR` | Max heart rate (bpm) |
 | `TRAININGEDGE_RESTING_HR` | Resting heart rate (bpm) |
 | `TRAININGEDGE_PASSWORD` | Web access password (optional) |
+| `GARMIN_EMAIL` | Garmin login email (for auto-fetching token) |
+| `GARMIN_PASSWORD` | Garmin login password (for auto-fetching token) |
 | `GARMINTOKENS` | Garmin OAuth token directory |
+| `GARMIN_IS_CN` | Set to `true` if your account is in Garmin China (`garmin.cn`) |
 | `OPENROUTER_API_KEY` | Required for AI features (or configure in web settings) |
 
 See [.env.example](.env.example) for all variables.

@@ -114,7 +114,10 @@ sudo $DOCKER run -d --name training-edge --restart unless-stopped \
   -e TRAININGEDGE_FIT_DIR=/data/fit_files \
   -e TRAININGEDGE_LOG_FILE=/data/training_edge.log \
   -e TRAININGEDGE_FTP=229 -e TRAININGEDGE_MAX_HR=192 -e TRAININGEDGE_RESTING_HR=42 \
+  -e GARMIN_EMAIL=${GARMIN_EMAIL} \
+  -e GARMIN_PASSWORD=${GARMIN_PASSWORD} \
   -e GARMINTOKENS=/data/tokens \
+  -e GARMIN_IS_CN=false \
   -e TZ=Asia/Shanghai \
   -e TRAININGEDGE_PASSWORD=${TRAININGEDGE_PASSWORD} \
   -e TRAININGEDGE_SESSION_SECRET=${TRAININGEDGE_SESSION_SECRET} \

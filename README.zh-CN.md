@@ -93,7 +93,10 @@ python scripts/cli.py serve --reload --port 8420
 | `TRAININGEDGE_MAX_HR` | 最大心率 (bpm) |
 | `TRAININGEDGE_RESTING_HR` | 静息心率 (bpm) |
 | `TRAININGEDGE_PASSWORD` | Web 访问密码（可选） |
+| `GARMIN_EMAIL` | Garmin 登录邮箱（用于自动获取或刷新 Token） |
+| `GARMIN_PASSWORD` | Garmin 登录密码（用于自动获取或刷新 Token） |
 | `GARMINTOKENS` | Garmin OAuth token 目录 |
+| `GARMIN_IS_CN` | 是否使用 Garmin 中国区 (`garmin.cn`)，设置为 `true` 启用 |
 | `OPENROUTER_API_KEY` | AI 功能所需（可在 Web 设置页配置） |
 
 完整变量列表见 [.env.example](.env.example)。
