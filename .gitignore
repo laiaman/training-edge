@@ -15,6 +15,12 @@ state/*.db-shm
 state/*.db-wal
 state/fit_files/
 state/tokens/
+data/
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/fit_files/
+data/tokens/
 *.log
 
 # NAS deploy data
