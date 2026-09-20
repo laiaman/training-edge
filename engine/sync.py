@@ -10,13 +10,22 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from . import fit_parser, metrics, database
+from . import fit_parser, metrics, database, garmin_db_adapter
 
 
-FIT_DIR = Path(
-    os.environ.get("TRAININGEDGE_FIT_DIR",
-                    str(Path(__file__).resolve().parents[1] / "state" / "fit_files"))
-)
+def _resolve_fit_dir() -> Path:
+    """解析 FIT 目录：支持 ~ 展开；相对路径以项目根为基准。"""
+    raw = os.environ.get("TRAININGEDGE_FIT_DIR")
+    root = Path(__file__).resolve().parents[1]
+    if not raw:
+        return root / "state" / "fit_files"
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        p = root / p
+    return p.resolve()
+
+
+FIT_DIR = _resolve_fit_dir()
 
 
 def _ensure_fit_dir():
@@ -28,7 +37,9 @@ def get_garmin_client():
     from garminconnect import Garmin
 
     token_dir = os.environ.get("GARMINTOKENS", "")
-    if not token_dir:
+    if token_dir:
+        token_dir = str(Path(token_dir).expanduser())
+    else:
         # Fallback to the existing skill's token location
         token_dir = str(
             Path(__file__).resolve().parents[3]
@@ -336,13 +347,21 @@ def sync_recent(
 
 
 def sync_garmin_wellness(days: int = 14) -> Dict[str, Any]:
-    """Sync wellness data (HRV, sleep, body battery, etc.) from Garmin Connect.
+    """Sync wellness data (HRV, sleep, body battery, etc.).
 
-    Fetches daily summaries and stores in both wellness and body_composition tables.
+    If GARMIN_DB_PATH is set and the file exists, reads from the Hermes-maintained
+    garmin.db via the adapter (no API calls needed). Otherwise falls back to
+    fetching directly from Garmin Connect API.
 
     Returns:
         Summary of synced data.
     """
+    garmin_db = os.environ.get("GARMIN_DB_PATH")
+    if garmin_db and Path(garmin_db).exists():
+        count = garmin_db_adapter.sync_from_garmin_db(garmin_db, days)
+        return {"days_synced": count, "hrv_count": 0, "sleep_count": 0,
+                "errors": [], "source": "garmin.db"}
+
     api = get_garmin_client()
     today = date.today()
     results = {"days_synced": 0, "hrv_count": 0, "sleep_count": 0, "errors": []}
@@ -371,13 +390,31 @@ def sync_garmin_wellness(days: int = 14) -> Dict[str, Any]:
                     # Try different response formats
                     if isinstance(hrv_data, dict):
                         summary = hrv_data.get("hrvSummary") or hrv_data.get("summary") or {}
-                        hrv_ms = summary.get("weeklyAvg") or summary.get("lastNightAvg") or summary.get("lastNight5MinHigh")
+                        
+                        # 明确：Garmin 记录的单日 HRV 是 lastNightAvg
+                        hrv_ms = summary.get("lastNightAvg")
+                        
+                        if not hrv_ms:
+                             hrv_ms = summary.get("lastNight5MinHigh")
+                        
+                        # 兜底
                         if not hrv_ms and "startTimestampGMT" in summary:
-                            hrv_ms = summary.get("weeklyAvg")
+                            hrv_ms = summary.get("lastNightAvg")
+
+                    if hrv_ms is None and hrv_data and isinstance(hrv_data, dict) and hrv_data.get("hrvReadings"):
+                        outer_summary = hrv_data.get("hrvSummary", {})
+                        hrv_ms = outer_summary.get("lastNightAvg")
+
+                    # Do NOT calculate float average from hrvReadings. Leave as None if not an int.
+                    if hrv_ms is not None:
+                        try:
+                            hrv_ms = int(round(float(hrv_ms)))
+                        except ValueError:
+                            hrv_ms = None
+                        
                     if hrv_ms:
                         results["hrv_count"] += 1
             except Exception as e:
-                # HRV not available for this day is common
                 pass
 
             # --- Sleep ---

@@ -271,10 +271,10 @@ function toggleTrendDetail() {
 <!-- ── Garmin 健康指标 ── -->
 {% set g = latest_garmin %}
 {% set w = wellness_history[0] if wellness_history else None %}
-<div style="display:grid; grid-template-columns:repeat(4,1fr); gap:16px; margin:16px 0;">
-    <!-- HRV (优先用 wellness 数据，回退到 body_composition Garmin 数据) -->
+<div style="display:grid; grid-template-columns:repeat(5,1fr); gap:16px; margin:16px 0;">
+    <!-- 最新 HRV -->
     <div class="card">
-        <div class="card-label">HRV</div>
+        <div class="card-label">单日 HRV</div>
         <div class="metric metric-sm">
             {% set hrv_val = w.hrv if w and w.hrv else (g.hrv_ms if g and g.hrv_ms else None) %}
             <div class="metric-value" style="color:var(--green);">{{ '%.0f'|format(hrv_val) if hrv_val else '—' }}</div>
@@ -292,6 +292,30 @@ function toggleTrendDetail() {
         {% if not hrv_val %}
         <div style="font-size:11px; color:var(--text-tertiary); margin-top:4px;">需同步 Garmin 数据</div>
         {% elif w %}<div style="font-size:11px; color:var(--text-tertiary); margin-top:4px;">{{ w.date }}</div>{% endif %}
+    </div>
+    <!-- 七日平均 HRV -->
+    <div class="card">
+        <div class="card-label">7日平均 HRV</div>
+        <div class="metric metric-sm">
+            {% set w7 = wellness_history[:7] if wellness_history else [] %}
+            {% set valid_hrv = [] %}
+            {% for item in w7 %}
+                {% if item.hrv %}
+                    {% set _ = valid_hrv.append(item.hrv) %}
+                {% endif %}
+            {% endfor %}
+            {% if valid_hrv|length > 0 %}
+                {% set hrv_7d_avg = valid_hrv|sum / valid_hrv|length %}
+            {% else %}
+                {% set hrv_7d_avg = None %}
+            {% endif %}
+
+            <div class="metric-value" style="color:var(--blue);">{{ '%.0f'|format(hrv_7d_avg) if hrv_7d_avg else '—' }}</div>
+            <div class="metric-label">ms</div>
+        </div>
+        <div style="font-size:11px; color:var(--text-tertiary); margin-top:4px;">
+            {% if valid_hrv|length > 0 %}基于近 {{ valid_hrv|length }} 天数据{% else %}需同步 Garmin 数据{% endif %}
+        </div>
     </div>
     <!-- 睡眠时长 -->
     <div class="card">
@@ -677,7 +701,8 @@ function toggleTrendDetail() {
         <thead>
             <tr>
                 <th>日期</th>
-                <th>HRV</th>
+                <th>HRV (单日)</th>
+                <th>HRV (7日平均)</th>
                 <th>静息心率</th>
                 <th>睡眠时长</th>
                 <th>睡眠评分</th>
@@ -685,12 +710,31 @@ function toggleTrendDetail() {
             </tr>
         </thead>
         <tbody>
-            {% for r in wellness_history %}
+            {% for i in range(wellness_history|length) %}
+            {% set r = wellness_history[i] %}
             <tr>
                 <td style="white-space:nowrap;">{{ r.date }}</td>
                 <td>
                     {% if r.hrv %}
                         <span style="font-weight:600; color:{% if r.hrv >= 65 %}var(--green){% elif r.hrv >= 50 %}var(--orange){% else %}var(--red){% endif %};">{{ '%.0f'|format(r.hrv) }}</span>
+                        <span style="color:var(--text-tertiary); font-size:12px;">ms</span>
+                    {% else %}—{% endif %}
+                </td>
+                <td>
+                    {# 计算截至这一天的过去7天平均 HRV #}
+                    {% set start_idx = i %}
+                    {% set end_idx = i + 7 %}
+                    {% set history_window = wellness_history[start_idx:end_idx] %}
+                    {% set valid_hrv_window = [] %}
+                    {% for item in history_window %}
+                        {% if item.hrv %}
+                            {% set _ = valid_hrv_window.append(item.hrv) %}
+                        {% endif %}
+                    {% endfor %}
+                    
+                    {% if valid_hrv_window|length > 0 %}
+                        {% set hrv_avg = valid_hrv_window|sum / valid_hrv_window|length %}
+                        <span style="font-weight:600; color:var(--blue);">{{ '%.0f'|format(hrv_avg) }}</span>
                         <span style="color:var(--text-tertiary); font-size:12px;">ms</span>
                     {% else %}—{% endif %}
                 </td>
@@ -714,9 +758,10 @@ function toggleTrendDetail() {
                 </td>
                 <td style="color:var(--text-secondary); font-size:13px;">{{ r.notes or '' }}</td>
             </tr>
-            {% else %}
-            <tr><td colspan="6" style="text-align:center; color:var(--text-tertiary); padding:24px;">暂无 Garmin 健康数据</td></tr>
             {% endfor %}
+            {% if wellness_history|length == 0 %}
+            <tr><td colspan="7" style="text-align:center; color:var(--text-tertiary); padding:24px;">暂无 Garmin 健康数据</td></tr>
+            {% endif %}
         </tbody>
     </table>
     </div>
@@ -932,7 +977,7 @@ function renderHrvChart(days) {
             labels: data.map(d => d.date),
             datasets: [
                 {
-                    label: 'HRV (ms)',
+                    label: '单日 HRV (ms)',
                     data: data.map(d => d.hrv || d.hrv_ms || null),
                     borderColor: '#30d158',
                     backgroundColor: ctx => {
@@ -949,6 +994,30 @@ function renderHrvChart(days) {
                     pointRadius: 3,
                     pointHoverRadius: 5,
                     borderWidth: 2.5,
+                    yAxisID: 'y',
+                    spanGaps: true,
+                },
+                {
+                    label: '7日平均 HRV',
+                    data: data.map((d, index, arr) => {
+                        let sum = 0;
+                        let count = 0;
+                        for (let j = index; j >= Math.max(0, index - 6); j--) {
+                            const val = arr[j].hrv || arr[j].hrv_ms;
+                            if (val) {
+                                sum += val;
+                                count++;
+                            }
+                        }
+                        return count > 0 ? (sum / count).toFixed(0) : null;
+                    }),
+                    borderColor: '#0a84ff',
+                    fill: false,
+                    tension: 0.4,
+                    pointRadius: 0,
+                    pointHoverRadius: 4,
+                    borderWidth: 2,
+                    borderDash: [5, 5],
                     yAxisID: 'y',
                     spanGaps: true,
                 },

@@ -4,7 +4,7 @@
   0. Training Phase State Machine — 周期化阶段判定，约束负荷包络
   1. Trigger Engine — 优先级仲裁矩阵（P1-P5），Cooldown 防抖
   2. Fallback Templates — 本地兜底：AI 故障/红线触发时的安全课表
-  3. PostCheck — AI 输出校验：TSS/IF/时长/连续高强度/周跃迁/动作越界
+  3. PostCheck — AI 输出校验：TSS/时长/连续高强度/周跃迁/动作越界
   4. Pipeline — 编排：Phase → Trigger → AI 生成 (or Fallback) → PostCheck → 落库
 
 核心原则: LLM 是受限规划器，不是决策中心。
@@ -18,11 +18,13 @@ from __future__ import annotations
 import json
 import logging
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from engine import llm_client
 
 logger = logging.getLogger(__name__)
+WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -45,8 +47,8 @@ _PHASE_CONSTRAINTS = {
         "max_daily_tss": 120,
         "min_rest_days": 1,
         "primary_zones": "Zone 1-3",
-        "key_workouts": ["长距离耐力骑", "有氧基础跑", "全身力量"],
-        "description": "有氧基础期：以 Zone 2 有氧骑行为主，建立耐力底座",
+        "key_workouts": ["轻松有氧跑", "渐进长距离", "力量维持"],
+        "description": "有氧基础期：堆叠跑量、建立有氧底盘和耐热能力",
     },
     TrainingPhase.BUILD: {
         "weekly_tss_multiplier": 1.1,
@@ -54,8 +56,8 @@ _PHASE_CONSTRAINTS = {
         "max_daily_tss": 150,
         "min_rest_days": 1,
         "primary_zones": "Zone 2-4",
-        "key_workouts": ["甜点间歇", "VO2max 短间歇", "阈值巡航", "力量训练"],
-        "description": "能力构建期：加入 Zone 3-4 间歇训练，渐进增加 TSS",
+        "key_workouts": ["Tinman CV 间歇", "阈值巡航", "渐进长距离", "力量维持"],
+        "description": "强化期：以 CV/阈值和长距离递进提升马拉松能力",
     },
     TrainingPhase.PEAK: {
         "weekly_tss_multiplier": 0.85,
@@ -63,8 +65,8 @@ _PHASE_CONSTRAINTS = {
         "max_daily_tss": 130,
         "min_rest_days": 2,
         "primary_zones": "Zone 4-5",
-        "key_workouts": ["VO2max 间歇", "比赛模拟", "短冲刺"],
-        "description": "巅峰期：高强度低量，保持锐度，赛前减量",
+        "key_workouts": ["M-Pace 节奏", "Mantz/Canova 长跑", "比赛补给演练"],
+        "description": "马拉松专项与巅峰期：在疲劳中维持目标配速并完成减量",
     },
     TrainingPhase.RECOVERY: {
         "weekly_tss_multiplier": 0.5,
@@ -72,7 +74,7 @@ _PHASE_CONSTRAINTS = {
         "max_daily_tss": 60,
         "min_rest_days": 3,
         "primary_zones": "Zone 1-2",
-        "key_workouts": ["恢复骑行", "轻松跑", "拉伸瑜伽"],
+        "key_workouts": ["恢复跑", "轻量核心", "拉伸放松"],
         "description": "恢复期：主动恢复为主，严禁高强度",
     },
     TrainingPhase.TRANSITION: {
@@ -81,7 +83,7 @@ _PHASE_CONSTRAINTS = {
         "max_daily_tss": 50,
         "min_rest_days": 3,
         "primary_zones": "Zone 1-2",
-        "key_workouts": ["自由骑行", "交叉训练", "休息"],
+        "key_workouts": ["轻松跑", "交叉训练", "休息"],
         "description": "过渡期：赛季间休整，保持基础活动量即可",
     },
 }
@@ -168,7 +170,7 @@ class TriggerPriority:
     P2_SAFETY_REDLINE = 2    # TSB 透支 / 连续 HRV 异常
     P3_ENV_STRESS = 3        # 高温高湿热应激（拦截假阳性，不触发调整）
     P4_EXECUTION_DEVIATION = 4  # 课表脱落 / TSS 偏差 >20%
-    P5_CAPACITY_UPGRADE = 5   # eFTP/W' 跃迁
+    P5_CAPACITY_UPGRADE = 5   # 跑步能力跃迁
 
 
 # Cooldown 最短间隔（小时）— 防止频繁重写
@@ -265,9 +267,8 @@ def evaluate_triggers(conn, phase: str) -> Tuple[str, str, Optional[str], List[D
         all_triggers.append({"priority": TriggerPriority.P4_EXECUTION_DEVIATION,
                              "code": "TRG_DEVIATION", "reason": recent_deviation})
 
-    # ── P5: 能力跃迁（eFTP 提升 >3%）──
-    # 需要 PDC 拟合逻辑，暂时通过手动 FTP 更新触发
-    # TODO: 自动 eFTP 检测
+    # ── P5: 能力跃迁 ──
+    # 后续可由近期比赛、阈值课或跑步能力测试生成单独提案。
 
     # ── 黄线: TSB 偏低但没到红线 ──
     if tsb < -15 and not any(t["priority"] <= TriggerPriority.P2_SAFETY_REDLINE
@@ -319,10 +320,12 @@ def _check_execution_deviation(conn) -> Optional[str]:
 
     # 获取实际 TSS
     actual = conn.execute(
-        "SELECT COALESCE(SUM(tss), 0) as total FROM activities WHERE date >= ?",
+        "SELECT SUM(tss) as total, COUNT(*) as activity_count, COUNT(tss) as tss_count FROM activities WHERE date >= ?",
         (cutoff,)
     ).fetchone()
-    actual_tss = actual["total"] if actual else 0
+    if not actual or not actual["activity_count"] or actual["tss_count"] != actual["activity_count"]:
+        return None
+    actual_tss = actual["total"]
 
     deviation = abs(actual_tss - planned_tss) / planned_tss if planned_tss > 0 else 0
 
@@ -345,9 +348,9 @@ def get_fallback_plan(template: str, week_start: date) -> List[Dict[str, Any]]:
             {"day_offset": 0, "sport": "rest",     "title": "完全休息",
              "description": "全天休息，拉伸放松", "target_tss": 0, "target_duration_min": 0,
              "target_intensity": "Rest", "muscle_groups": []},
-            {"day_offset": 1, "sport": "cycling",  "title": "恢复骑行",
-             "description": "Zone 1-2 轻松骑行，踏频90+，保持放松", "target_tss": 30, "target_duration_min": 45,
-             "target_intensity": "Zone 1-2", "muscle_groups": ["quadriceps", "glutes"]},
+            {"day_offset": 1, "sport": "running",  "title": "恢复跑",
+             "description": "5'30\"-6'00\"/km，心率<120bpm，全程放松", "target_tss": 25, "target_duration_min": 40,
+             "target_intensity": "Recovery", "muscle_groups": ["calves", "glutes"]},
             {"day_offset": 2, "sport": "training", "title": "轻量核心训练",
              "description": "平板支撑3x30s, 死虫式3x10, 臀桥3x15, 鸟狗式3x10。全程轻柔，以激活为主",
              "target_tss": 10, "target_duration_min": 30,
@@ -358,17 +361,17 @@ def get_fallback_plan(template: str, week_start: date) -> List[Dict[str, Any]]:
             {"day_offset": 4, "sport": "rest",     "title": "完全休息",
              "description": "全天休息", "target_tss": 0, "target_duration_min": 0,
              "target_intensity": "Rest", "muscle_groups": []},
-            {"day_offset": 5, "sport": "cycling",  "title": "有氧骑行",
-             "description": "Zone 2 骑行，稳定心率，不冲刺", "target_tss": 40, "target_duration_min": 60,
-             "target_intensity": "Zone 2", "muscle_groups": ["quadriceps", "glutes"]},
+            {"day_offset": 5, "sport": "running",  "title": "轻松有氧",
+             "description": "5'15\"-5'40\"/km，心率<135bpm", "target_tss": 35, "target_duration_min": 50,
+             "target_intensity": "Easy", "muscle_groups": ["calves", "glutes"]},
             {"day_offset": 6, "sport": "rest",     "title": "完全休息",
              "description": "拉伸放松，准备下周训练", "target_tss": 0, "target_duration_min": 0,
              "target_intensity": "Rest", "muscle_groups": []},
         ],
         "AI_FAILURE": [
-            {"day_offset": 0, "sport": "cycling",  "title": "有氧基础骑行",
-             "description": "Zone 2 骑行60-90分钟，踏频85-95", "target_tss": 50, "target_duration_min": 75,
-             "target_intensity": "Zone 2", "muscle_groups": ["quadriceps", "glutes"]},
+            {"day_offset": 0, "sport": "rest",  "title": "休息",
+             "description": "休息与跟腱维护", "target_tss": 0, "target_duration_min": 0,
+             "target_intensity": "Rest", "muscle_groups": []},
             {"day_offset": 1, "sport": "training", "title": "全身力量训练",
              "description": "深蹲4x8, 硬拉4x6, 推举3x10, 引体3xMax, 平板支撑3x45s",
              "target_tss": 20, "target_duration_min": 45,
@@ -379,17 +382,17 @@ def get_fallback_plan(template: str, week_start: date) -> List[Dict[str, Any]]:
             {"day_offset": 3, "sport": "rest",     "title": "休息日",
              "description": "完全休息", "target_tss": 0, "target_duration_min": 0,
              "target_intensity": "Rest", "muscle_groups": []},
-            {"day_offset": 4, "sport": "cycling",  "title": "甜点间歇骑行",
-             "description": "热身15min, 3x10min Zone 4 (FTP 95-105%), 间休5min, 放松10min",
-             "target_tss": 70, "target_duration_min": 75,
-             "target_intensity": "Zone 3-4", "muscle_groups": ["quadriceps", "glutes"]},
+            {"day_offset": 4, "sport": "running",  "title": "轻松有氧",
+             "description": "5'15\"-5'40\"/km，心率<140bpm",
+             "target_tss": 40, "target_duration_min": 55,
+             "target_intensity": "Easy", "muscle_groups": ["calves", "glutes"]},
             {"day_offset": 5, "sport": "training", "title": "上肢+核心训练",
              "description": "推举3x10, 哑铃划船3x12, 侧平举3x12, 平板支撑3x45s, 俄罗斯转体3x15",
              "target_tss": 15, "target_duration_min": 40,
              "target_intensity": "Mixed", "muscle_groups": ["chest", "back", "shoulders", "core"]},
-            {"day_offset": 6, "sport": "cycling",  "title": "长距离耐力骑行",
-             "description": "Zone 2 长骑 2-3小时，中途补给", "target_tss": 80, "target_duration_min": 150,
-             "target_intensity": "Zone 2", "muscle_groups": ["quadriceps", "glutes"]},
+            {"day_offset": 6, "sport": "running",  "title": "轻松长跑",
+             "description": "按当前周计划的80%距离执行，心率优先，不加速", "target_tss": 65, "target_duration_min": 100,
+             "target_intensity": "Easy", "muscle_groups": ["calves", "glutes"]},
         ],
     }
 
@@ -412,7 +415,6 @@ def get_fallback_plan(template: str, week_start: date) -> List[Dict[str, Any]]:
 
 # 每个训练类型的 TSS 硬上限
 _TSS_LIMITS = {
-    "cycling": 250,
     "running": 150,
     "training": 80,
     "rest": 0,
@@ -420,17 +422,16 @@ _TSS_LIMITS = {
 
 # 单项训练时长上限（分钟）
 _DURATION_LIMITS = {
-    "cycling": 300,
-    "running": 150,
+    "running": 240,
     "training": 90,
     "rest": 0,
 }
 
 
-def postcheck_workout(w: Dict[str, Any], ftp: float = 229,
+def postcheck_workout(w: Dict[str, Any],
                        phase_constraints: Optional[Dict] = None) -> Dict[str, Any]:
     """校验单条训练。钳位不合理数值，不直接拒绝。"""
-    sport = w.get("sport", "cycling")
+    sport = w.get("sport", "running")
     tss = w.get("target_tss", 0) or 0
     duration = w.get("target_duration_min", 0) or 0
     issues = []
@@ -450,22 +451,14 @@ def postcheck_workout(w: Dict[str, Any], ftp: float = 229,
         issues.append(f"时长 {duration}min → {dur_limit}min")
         w["target_duration_min"] = dur_limit
 
-    # CK_03: IF 隐含校验（骑行 >30min，IF >1.15 不合理）
-    if duration >= 30 and sport == "cycling" and ftp > 0 and tss > 0:
-        implied_if = (w.get("target_tss", tss) / (duration / 60)) ** 0.5
-        if implied_if > 1.15:
-            safe_tss = int(1.15 ** 2 * (duration / 60))
-            issues.append(f"IF={implied_if:.2f}>1.15, TSS→{safe_tss}")
-            w["target_tss"] = safe_tss
-
-    # CK_04: 休息日清零
+    # CK_03: 休息日清零
     if sport == "rest" and tss > 0:
         w["target_tss"] = 0
         w["target_duration_min"] = 0
         issues.append("休息日清零")
 
-    # CK_05: 负数拦截
-    for key in ("target_tss", "target_duration_min"):
+    # CK_04: 负数拦截
+    for key in ("target_tss", "target_duration_min", "target_distance_km"):
         if (w.get(key) or 0) < 0:
             w[key] = 0
 
@@ -475,14 +468,13 @@ def postcheck_workout(w: Dict[str, Any], ftp: float = 229,
     return w
 
 
-def postcheck_plan(workouts: List[Dict[str, Any]], ftp: float = 229,
-                    weekly_tss_cap: Optional[float] = None,
+def postcheck_plan(workouts: List[Dict[str, Any]], weekly_tss_cap: Optional[float] = None,
                     phase_constraints: Optional[Dict] = None) -> List[Dict[str, Any]]:
     """校验整个周计划。"""
     pc = phase_constraints or {}
 
     # 逐条校验
-    checked = [postcheck_workout(w, ftp, pc) for w in workouts]
+    checked = [postcheck_workout(w, pc) for w in workouts]
 
     # CK_06: 周 TSS 总量
     total_tss = sum(w.get("target_tss", 0) or 0 for w in checked)
@@ -509,7 +501,7 @@ def postcheck_plan(workouts: List[Dict[str, Any]], ftp: float = 229,
     # CK_08: 高强度天数限制（按阶段）
     max_intensity_days = pc.get("max_intensity_days", 3)
     intensity_days = [w for w in checked
-                      if w.get("sport") == "cycling"
+                      if w.get("sport") == "running"
                       and (w.get("target_tss", 0) or 0) > 70]
     if len(intensity_days) > max_intensity_days:
         # 按 TSS 降序，多余的降级
@@ -535,18 +527,17 @@ def postcheck_plan(workouts: List[Dict[str, Any]], ftp: float = 229,
 # ═══════════════════════════════════════════════════════════════════════════
 
 DEFAULT_PROFILE = {
-    "ftp": 229,
-    "max_hr": 192,
-    "resting_hr": 42,
-    "goal": "提升骑行能力，维持跑步基础，增强核心力量",
-    "focus": "cycling",
-    "weekly_hours_available": 10,
-    "event_name": "",
-    "event_date": "",
+    "max_hr": 175,
+    "resting_hr": 41,
+    "goal": "2026北京马拉松 2:55，南昌马拉松备选峰值",
+    "focus": "running",
+    "weekly_hours_available": 8,
+    "event_name": "2026北京马拉松",
+    "event_date": "2026-10-18",
     "constraints": [
-        "每周至少1次跑步",
-        "每周2-3次力量训练",
-        "骑行为主要训练项目",
+        "周三晚固定田径场质量课",
+        "周日长距离",
+        "保护腰骶部、跟腱和比目鱼肌",
     ],
 }
 
@@ -562,9 +553,9 @@ def gather_context(conn) -> Dict[str, Any]:
 
     cutoff = (date.today() - timedelta(days=14)).isoformat()
     recent = conn.execute(
-        """SELECT date, name, sport, distance_m, total_timer_s, tss,
-                  normalized_power, avg_hr, intensity_factor
-           FROM activities WHERE date >= ? ORDER BY date DESC""",
+        """SELECT date, name, sport, distance_m, total_timer_s, tss, avg_hr, avg_cadence
+           FROM activities WHERE date >= ? AND sport IN ('running', 'training')
+           ORDER BY date DESC""",
         (cutoff,),
     ).fetchall()
     recent_list = [dict(r) for r in recent]
@@ -613,16 +604,77 @@ def _load_profile(conn, overrides: Optional[Dict[str, Any]] = None) -> Dict[str,
     return profile
 
 
+def _load_authoritative_context(week_start: date, week_end: date) -> tuple[str, Optional[str]]:
+    """Load the four project authorities and the active baseline week for AI proposals."""
+    from engine import plan_store
+
+    source_paths = (
+        WORKSPACE_ROOT / "vault" / "profile" / "profile.md",
+        WORKSPACE_ROOT / "vault" / "profile" / "injuries.md",
+        WORKSPACE_ROOT / "vault" / "goals" / "current_goal.md",
+    )
+    source_sections = []
+    for path in source_paths:
+        try:
+            source_sections.append(f"### {path.name}\n{path.read_text(encoding='utf-8').strip()}")
+        except OSError as exc:
+            source_sections.append(f"### {path.name}\n读取失败：{exc}")
+    try:
+        document = plan_store.load_plan()
+        baseline = [
+            workout for workout in document.get("workouts", [])
+            if week_start.isoformat() <= workout.get("date", "") <= week_end.isoformat()
+        ]
+        canonical_phase = next((workout.get("phase") for workout in baseline if workout.get("phase")), None)
+        decision_context = {
+            "plan": document.get("plan", {}),
+            "goal": document.get("goal", {}),
+            "athlete_constraints": document.get("athlete_constraints", {}),
+            "decision_gate": document.get("decision_gate", {}),
+            "adaptation_rules": document.get("adaptation_rules", {}),
+            "support_training": document.get("support_training", {}),
+            "cross_training_rules": document.get("cross_training_rules", {}),
+            "preparation_templates": document.get("preparation_templates", []),
+            "active_baseline_week": baseline,
+        }
+        source_sections.append(
+            "### 当前结构化计划与规则\n" + json.dumps(decision_context, ensure_ascii=False, indent=2)
+        )
+    except Exception as exc:
+        canonical_phase = None
+        source_sections.append(f"### 当前结构化计划与规则\n读取失败：{exc}")
+    return "\n\n".join(source_sections), canonical_phase
+
+
+def _phase_code(label: Optional[str]) -> Optional[str]:
+    if not label:
+        return None
+    if "基础" in label:
+        return TrainingPhase.BASE
+    if "强化" in label:
+        return TrainingPhase.BUILD
+    if "专项" in label or "减量" in label or "巅峰" in label:
+        return TrainingPhase.PEAK
+    if "恢复" in label:
+        return TrainingPhase.RECOVERY
+    if "过渡" in label:
+        return TrainingPhase.TRANSITION
+    return None
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Plan Generation Prompt — Action Space 约束版
 # ═══════════════════════════════════════════════════════════════════════════
 
-_PLAN_PROMPT = """你是一位专业的自行车和铁三教练，精通 TrainingPeaks 和 Intervals.icu 的训练方法论。
+_PLAN_PROMPT = """你是一位专业跑步教练，精通 Tinman CV、Canova 专项耐力和 Mantz 带疲劳目标配速训练。
 
 请根据以下运动员信息，为下周（{week_start} 至 {week_end}）生成详细的训练计划。
 
 ## 运动员档案
 {athlete_profile}
+
+## 项目权威上下文（硬约束，优先于模型常识）
+{authoritative_context}
 
 ## 当前训练阶段
 {phase_info}
@@ -644,24 +696,34 @@ _PLAN_PROMPT = """你是一位专业的自行车和铁三教练，精通 Trainin
 
 ## 输出要求
 1. 生成7天的训练计划（周一到周日）
-2. 每个训练包含：日期、运动类型(cycling/running/training/rest)、训练名称、描述、目标TSS、预计时长(分钟)、强度区间、涉及肌群
+2. 每个训练包含：日期、运动类型、训练名称、描述、目标距离、预计时长、配速、心率和RPE范围
 3. **严格遵守系统约束中的 TSS 上限、高强度天数限制和休息日要求**
 4. 符合当前训练阶段的目标和重点
 5. 力量训练要具体到动作和组数
-6. 骑行训练包含功率区间目标（基于FTP={ftp}W）
-7. 跑步训练包含配速或心率区间目标
+6. 跑步训练必须完整输出 target_pace_text、target_hr_text、target_rpe_min、target_rpe_max
+7. 周三优先质量课，周日优先长距离，力量训练不得损害关键跑课
+8. 当前结构化计划是基线，只提出确有证据支持的调整，不得无理由重写整周
 
 请以 JSON 数组格式返回：
 ```json
 [
   {{
     "date": "YYYY-MM-DD",
-    "sport": "cycling|running|training|rest",
+    "sport": "running|training|rest",
     "name": "训练名称",
     "description": "详细训练内容",
+    "target_distance_km": 12,
     "target_tss": 80,
     "duration_min": 90,
     "intensity": "Zone 2|Zone 3|Zone 4|Mixed|Recovery|Rest",
+    "target_pace_text": "4'30\"-4'35\"/km",
+    "target_hr_text": "145-155",
+    "target_hr_min": 145,
+    "target_hr_max": 155,
+    "target_rpe_min": 6,
+    "target_rpe_max": 7,
+    "steps": [{{"order": 1, "instruction": "热身2km"}}, {{"order": 2, "instruction": "主段8km@4'30\"-4'35\""}}],
+    "safety_cutoff": "出现伤病信号或心率越过处方上限时降级",
     "muscle_groups": ["quadriceps", "glutes", "core"]
   }}
 ]
@@ -687,7 +749,6 @@ def generate_weekly_plan(
     from engine import database
 
     merged_profile = _load_profile(conn, profile)
-    ftp = merged_profile.get("ftp", 229)
 
     # Calculate week dates
     today = date.today()
@@ -695,8 +756,14 @@ def generate_weekly_plan(
     week_start = ref - timedelta(days=ref.weekday())
     week_end = week_start + timedelta(days=6)
 
+    authoritative_context, canonical_phase_label = _load_authoritative_context(week_start, week_end)
+
     # ── Layer 0: 训练阶段判定 ──
     phase, phase_reason = detect_training_phase(conn)
+    canonical_phase = _phase_code(canonical_phase_label)
+    if canonical_phase:
+        phase = canonical_phase
+        phase_reason = f"当前结构化计划阶段: {canonical_phase_label}"
     phase_constraints = _PHASE_CONSTRAINTS.get(phase, _PHASE_CONSTRAINTS[TrainingPhase.BUILD])
     logger.info("Phase: %s — %s", phase, phase_reason)
 
@@ -714,7 +781,7 @@ def generate_weekly_plan(
     if trigger_action == TriggerAction.LOCAL_OVERRIDE:
         logger.warning("⚠️ 安全红线/恢复期: %s → 兜底课表 [%s]", trigger_reason, fallback_template)
         workouts = get_fallback_plan(fallback_template, week_start)
-        workouts = postcheck_plan(workouts, ftp=ftp, phase_constraints=phase_constraints)
+        workouts = postcheck_plan(workouts, phase_constraints=phase_constraints)
         _record_generation(conn, phase, trigger_action, trigger_reason, len(workouts))
         return workouts
 
@@ -755,13 +822,12 @@ def generate_weekly_plan(
 
     recent_str = ""
     for a in ctx["recent_activities"][:10]:
-        sport_zh = {"cycling": "骑行", "running": "跑步", "training": "力量"}.get(
+        sport_zh = {"running": "跑步", "training": "力量"}.get(
             a.get("sport", ""), a.get("sport", ""))
         dist = f"{a['distance_m']/1000:.1f}km" if a.get("distance_m") else ""
         dur = f"{a['total_timer_s']/60:.0f}min" if a.get("total_timer_s") else ""
         tss_s = f"TSS:{a['tss']:.0f}" if a.get("tss") else ""
-        np_s = f"NP:{a['normalized_power']:.0f}W" if a.get("normalized_power") else ""
-        recent_str += f"- {a['date']} | {sport_zh} | {a.get('name','')} | {dist} {dur} {tss_s} {np_s}\n"
+        recent_str += f"- {a['date']} | {sport_zh} | {a.get('name','')} | {dist} {dur} {tss_s}\n"
     if not recent_str:
         recent_str = "暂无近期训练数据"
 
@@ -783,7 +849,6 @@ def generate_weekly_plan(
 
     last_week = ctx["last_week_stats"]
     athlete_str = (
-        f"FTP: {ftp}W\n"
         f"最大心率: {merged_profile['max_hr']}bpm\n"
         f"静息心率: {merged_profile['resting_hr']}bpm\n"
         f"训练目标: {merged_profile['goal']}\n"
@@ -795,7 +860,6 @@ def generate_weekly_plan(
         athlete_str += f"目标赛事: {merged_profile['event_name']} ({merged_profile.get('event_date', '待定')})\n"
     athlete_str += (
         f"上周数据({last_week.get('week_label', '上周')}): "
-        f"骑行{last_week.get('cycling_distance_km', 0):.1f}km, "
         f"跑步{last_week.get('running_distance_km', 0):.1f}km, "
         f"力量{last_week.get('strength_count', 0)}次, "
         f"TSS{last_week.get('total_tss', 0):.0f}"
@@ -805,13 +869,13 @@ def generate_weekly_plan(
         week_start=week_start.isoformat(),
         week_end=week_end.isoformat(),
         athlete_profile=athlete_str,
+        authoritative_context=authoritative_context,
         phase_info=phase_info,
         fitness_status=fitness_str,
         hard_constraints=hard_constraints_str,
         recent_activities=recent_str,
         body_data=body_str,
         muscle_fatigue=fatigue_str,
-        ftp=ftp,
     )
 
     # ── AI 生成（带 Fallback）──
@@ -827,7 +891,7 @@ def generate_weekly_plan(
     except Exception as e:
         logger.error("AI 生成失败: %s → 兜底课表", e)
         workouts = get_fallback_plan("AI_FAILURE", week_start)
-        workouts = postcheck_plan(workouts, ftp=ftp, phase_constraints=phase_constraints)
+        workouts = postcheck_plan(workouts, phase_constraints=phase_constraints)
         _record_generation(conn, phase, "AI_FAILURE", str(e), len(workouts))
         return workouts
 
@@ -843,6 +907,10 @@ def generate_weekly_plan(
             w["target_duration_min"] = w.pop("duration_min")
         if "intensity" in w and "target_intensity" not in w:
             w["target_intensity"] = w.pop("intensity")
+        if w.get("target_duration_min") is not None:
+            w.setdefault("target_duration_source", "ai_estimated")
+        if w.get("target_tss") is not None:
+            w.setdefault("target_tss_source", "ai_estimated")
         if isinstance(w.get("muscle_groups"), list):
             normalized = list(dict.fromkeys(
                 _MG_ALIASES.get(g.lower().strip(), g.lower().strip())
@@ -852,8 +920,7 @@ def generate_weekly_plan(
             del w["muscle_groups"]
 
     # ── Layer 3: PostCheck ──
-    workouts = postcheck_plan(workouts, ftp=ftp,
-                               weekly_tss_cap=weekly_tss_cap,
+    workouts = postcheck_plan(workouts, weekly_tss_cap=weekly_tss_cap,
                                phase_constraints=phase_constraints)
 
     total_tss = sum(w.get("target_tss", 0) or 0 for w in workouts)

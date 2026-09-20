@@ -296,15 +296,47 @@ def compute_readiness(conn: sqlite3.Connection, on_date: Optional[str] = None) -
     anomaly_conditions: List[str] = []
     _detect_anomaly_patterns(conn, today_str, rhr_mean, anomaly_conditions)
 
-    # data_insufficient：3+ 个关键指标缺失
-    if missing_count >= 3:
+    # data_insufficient：3+ 个关键指标缺失（仅完全缺失，"数据不足"不计入）
+    truly_missing = [k for k, v in scoring.items() if v == "缺失"]
+    if len(truly_missing) >= 3:
         anomaly_conditions.append("data_insufficient")
 
     if anomaly_conditions:
+        # 按条件类型生成具体描述
+        messages = []
+        details = []
+        has_real_anomaly = False
+        for cond in anomaly_conditions:
+            if cond == "data_insufficient":
+                label_map = {"hrv": "HRV", "rhr": "静息心率", "sleep": "睡眠", "tsb": "TSB（体能状态）"}
+                missing_labels = [label_map.get(k, k) for k in truly_missing]
+                messages.append(f"今日缺失 {len(truly_missing)} 项关键数据（{'、'.join(missing_labels)}），评估可靠性有限")
+                details.append({"code": cond, "label": "数据缺失", "desc": f"{'、'.join(missing_labels)} 未同步"})
+            elif cond == "rhr_elevated_3d":
+                has_real_anomaly = True
+                messages.append("静息心率连续 3 天偏高，可能提示过度训练或免疫压力")
+                details.append({"code": cond, "label": "心率持续偏高", "desc": "RHR 连续 3 天 > 7日均值+1SD"})
+            elif cond == "hrv_declining_5d":
+                has_real_anomaly = True
+                messages.append("HRV 连续 5 天下降，自主神经恢复能力可能受限")
+                details.append({"code": cond, "label": "HRV 持续下降", "desc": "连续 5 天递减趋势"})
+            elif cond == "sleep_deficit_3d":
+                has_real_anomaly = True
+                messages.append("连续 3 天睡眠不足 6 小时，恢复质量受到影响")
+                details.append({"code": cond, "label": "睡眠连续不足", "desc": "连续 3 天 < 6h"})
+
+        if has_real_anomaly:
+            summary = "检测到异常恢复信号，建议降低训练强度并人工复核。"
+        else:
+            summary = "部分健康数据尚未同步，建议先完成数据同步后再参考训练建议。"
+
         result.anomaly_alert = {
             "triggered": True,
             "conditions": anomaly_conditions,
-            "message": "当前存在异常恢复或数据不足情况，建议减少训练强度并由人工复核，不建议仅依据系统自动建议继续推进训练。",
+            "details": details,
+            "message": " ".join(messages),
+            "summary": summary,
+            "is_data_only": not has_real_anomaly,
         }
 
     return result
@@ -385,12 +417,18 @@ class WeeklyDeviation:
     actual_count: int = 0
     planned_tss: float = 0
     actual_tss: float = 0
+    tss_available: bool = False
+    tss_coverage_pct: float = 0
     deviation_pct: float = 0  # actual/planned %
     judgment: str = "无数据"  # 正常 / 略落后 / 明显落后 / 过载
     suggestion: str = ""
     skipped: List[Dict[str, Any]] = field(default_factory=list)
     remaining_days: int = 0
     remaining_tss: float = 0
+    # 截至今日的期望值（用于按进度判断，而非拿整周做分母）
+    expected_count_by_today: int = 0
+    expected_tss_by_today: float = 0
+    week_progress_pct: float = 0  # 本周已过进度百分比 (0-100)
     # 主项（骑行/跑步）vs 力量训练分类统计
     primary_planned: int = 0   # 骑行/跑步计划场次
     primary_actual: int = 0    # 骑行/跑步实际场次
@@ -433,15 +471,40 @@ def compute_weekly_deviation(
     result.planned_count = len(planned_workouts)
     result.planned_tss = sum(_safe_float(w["target_tss"]) or 0 for w in planned_workouts)
 
-    result.actual_count = len(activities)
-    result.actual_tss = sum(_safe_float(a["tss"]) or 0 for a in activities)
+    activity_ids = {str(a["id"]) for a in activities}
+    linked_rows = conn.execute(
+        """SELECT l.planned_workout_id, CAST(l.activity_id AS TEXT) AS activity_id,
+                  pw.sport AS plan_sport
+             FROM planned_workout_activity_links l
+             JOIN planned_workouts pw ON pw.id=l.planned_workout_id
+            WHERE pw.date >= ? AND pw.date <= ?""",
+        (monday.isoformat(), sunday.isoformat()),
+    ).fetchall()
+    linked_activity_ids = {
+        row["activity_id"] for row in linked_rows if row["activity_id"] in activity_ids
+    }
+    linked_plan_ids = {row["planned_workout_id"] for row in linked_rows}
+    # 一堂计划课可以由多条活动记录组成：距离/TSS 累加，课次按计划去重。
+    result.actual_count = len(linked_plan_ids) + len(activity_ids - linked_activity_ids)
+    known_tss = [_safe_float(a["tss"]) for a in activities if _safe_float(a["tss"]) is not None]
+    result.actual_tss = sum(known_tss)
+    result.tss_available = bool(activities) and len(known_tss) == len(activities)
+    result.tss_coverage_pct = round(len(known_tss) / len(activities) * 100, 1) if activities else 0
+
+    # ── 截至今日的期望值（按进度判断，不拿整周做分母）──
+    today_str = today.isoformat()
+    planned_by_today = [w for w in planned_workouts if w["date"] <= today_str]
+    result.expected_count_by_today = len(planned_by_today)
+    result.expected_tss_by_today = sum(_safe_float(w["target_tss"]) or 0 for w in planned_by_today)
+
+    elapsed_days = (today - monday).days + 1  # 1=周一, 7=周日
+    result.week_progress_pct = round(elapsed_days / 7.0 * 100, 1)
 
     # ── 主项 vs 力量分类统计 ──
-    # 主项运动类型（骑行/跑步/铁三相关）
     PRIMARY_SPORTS = {"cycling", "running", "swimming", "triathlon", "bike", "run", "swim",
                       "indoor_cycling", "virtual_ride", "trail_running", "open_water_swimming"}
     STRENGTH_SPORTS = {"strength", "strength_training", "weight_training", "gym",
-                       "力量", "力量训练", "crossfit"}
+                       "力量", "力量训练", "crossfit", "training"}
 
     for w in planned_workouts:
         sport = (w["sport"] or "").lower().strip()
@@ -450,18 +513,30 @@ def compute_weekly_deviation(
         elif sport in STRENGTH_SPORTS:
             result.strength_planned += 1
 
+    linked_primary_plan_ids = {
+        row["planned_workout_id"] for row in linked_rows
+        if (row["plan_sport"] or "").lower().strip() in PRIMARY_SPORTS
+    }
+    linked_strength_plan_ids = {
+        row["planned_workout_id"] for row in linked_rows
+        if (row["plan_sport"] or "").lower().strip() in STRENGTH_SPORTS
+    }
+    result.primary_actual = len(linked_primary_plan_ids)
+    result.strength_actual = len(linked_strength_plan_ids)
     for a in activities:
+        if str(a["id"]) in linked_activity_ids:
+            continue
         sport = (a["sport"] or "").lower().strip()
         if sport in PRIMARY_SPORTS:
             result.primary_actual += 1
         elif sport in STRENGTH_SPORTS:
             result.strength_actual += 1
 
-    # 偏差率
-    if result.planned_tss > 0:
+    # 偏差率（基于整周计划，用于进度条展示）
+    if result.tss_available and result.planned_tss > 0:
         result.deviation_pct = round(result.actual_tss / result.planned_tss * 100, 1)
     elif result.actual_tss > 0:
-        result.deviation_pct = 999  # 有实际但没计划
+        result.deviation_pct = 999
 
     # 已跳过的训练
     for w in planned_workouts:
@@ -472,7 +547,7 @@ def compute_weekly_deviation(
                 "sport": w["sport"],
                 "title": w["title"],
                 "target_tss": w["target_tss"],
-                "reason": "",  # 用户可后续标记
+                "reason": "",
             })
 
     # 剩余天数和 TSS
@@ -480,33 +555,166 @@ def compute_weekly_deviation(
     result.remaining_days = len(remaining_dates)
     result.remaining_tss = max(0, result.planned_tss - result.actual_tss)
 
-    # 综合判断
+    # ── 综合判断（基于截至今日的期望进度，而非整周）──
     if result.planned_count == 0:
         result.judgment = "无计划"
         result.suggestion = "本周暂无训练计划"
-    elif result.deviation_pct >= 110:
-        result.judgment = "过载"
-        result.suggestion = "实际训练量超出计划，注意恢复"
-    elif result.deviation_pct >= 85:
+    elif result.expected_count_by_today == 0:
+        # 本周刚开始，今天之前（含）没有计划训练
         result.judgment = "正常"
-        result.suggestion = "执行情况良好，按计划继续"
-    elif result.deviation_pct >= 60:
-        result.judgment = "略落后"
-        if result.remaining_days > 0:
-            daily_needed = result.remaining_tss / result.remaining_days if result.remaining_days > 0 else 0
-            result.suggestion = f"略有落后，剩余 {result.remaining_days} 天需完成 {result.remaining_tss:.0f} TSS（约 {daily_needed:.0f}/天）"
+        remaining_planned = [w for w in planned_workouts if w["date"] > today_str]
+        next_workout = remaining_planned[0] if remaining_planned else None
+        if next_workout:
+            result.suggestion = f"本周训练尚未开始，下一堂计划在 {next_workout['date'][5:]}（{next_workout['title']}）"
         else:
-            result.suggestion = "本周完成度偏低"
+            result.suggestion = "按计划执行"
     else:
-        result.judgment = "明显落后"
-        if result.remaining_days >= 2:
-            result.suggestion = "明显落后于计划，建议评估是否需要调整本周剩余安排"
-        elif result.remaining_days > 0:
-            result.suggestion = "明显落后，剩余时间有限，考虑顺延到下周"
+        # 基于截至今日的期望来判断
+        if result.tss_available and result.expected_tss_by_today > 0:
+            progress_pct = result.actual_tss / result.expected_tss_by_today * 100
         else:
-            result.suggestion = "本周完成度较低，建议回顾原因并调整下周计划"
+            progress_pct = result.actual_count / result.expected_count_by_today * 100
+
+        if result.tss_available and progress_pct >= 110:
+            result.judgment = "过载"
+            result.suggestion = "实际训练量超出计划进度，注意恢复"
+        elif progress_pct >= 80:
+            result.judgment = "正常"
+            result.suggestion = "执行情况良好，按计划继续"
+        elif progress_pct >= 50:
+            result.judgment = "略落后"
+            if result.tss_available and result.remaining_days > 0:
+                daily_needed = result.remaining_tss / result.remaining_days
+                result.suggestion = f"略有落后，剩余 {result.remaining_days} 天需完成 {result.remaining_tss:.0f} TSS（约 {daily_needed:.0f}/天）"
+            elif result.remaining_days > 0:
+                result.suggestion = f"截至今日完成 {result.actual_count}/{result.expected_count_by_today} 堂，优先保留关键课"
+            else:
+                result.suggestion = "本周完成度偏低"
+        else:
+            result.judgment = "明显落后"
+            missed_count = result.expected_count_by_today - result.actual_count
+            if missed_count > 0 and result.remaining_days >= 2:
+                result.suggestion = f"截至今日少完成 {missed_count} 堂训练，建议评估是否调整本周剩余安排"
+            elif result.remaining_days > 0:
+                result.suggestion = "明显落后，剩余时间有限，考虑顺延到下周"
+            else:
+                result.suggestion = "本周完成度较低，建议回顾原因并调整下周计划"
 
     return result
+
+
+# ───────────────────────────────────────────────────────────────
+# 2b. ACWR（急慢性负荷比）— 项目核心算法
+# ───────────────────────────────────────────────────────────────
+
+def compute_acwr(conn: sqlite3.Connection, on_date: Optional[str] = None) -> Dict[str, Any]:
+    """计算 ACWR（急慢性负荷比）。
+
+    ATL = 近 7 天日均 TSS；CTL = 近 28 天日均 TSS；ACWR = ATL / CTL。
+    安全区间 0.8-1.3；>1.3 受伤风险升高；>1.5 极高风险。
+    """
+    today = date.fromisoformat(on_date) if on_date else date.today()
+    d7 = (today - timedelta(days=6)).isoformat()
+    d28 = (today - timedelta(days=27)).isoformat()
+    today_str = today.isoformat()
+
+    row7 = conn.execute(
+        "SELECT COALESCE(SUM(tss), 0) AS s FROM activities WHERE date >= ? AND date <= ?",
+        (d7, today_str),
+    ).fetchone()
+    row28 = conn.execute(
+        "SELECT COALESCE(SUM(tss), 0) AS s FROM activities WHERE date >= ? AND date <= ?",
+        (d28, today_str),
+    ).fetchone()
+
+    atl_daily = (row7["s"] or 0) / 7.0
+    ctl_daily = (row28["s"] or 0) / 28.0
+
+    result: Dict[str, Any] = {
+        "atl_daily": round(atl_daily, 1),
+        "ctl_daily": round(ctl_daily, 1),
+        "acwr": None,
+        "status": "数据不足",
+        "level": "unknown",  # low / optimal / high / very_high / unknown
+    }
+
+    if ctl_daily > 0:
+        acwr = atl_daily / ctl_daily
+        result["acwr"] = round(acwr, 2)
+        if acwr < 0.8:
+            result["status"] = "负荷偏低"
+            result["level"] = "low"
+        elif acwr <= 1.3:
+            result["status"] = "安全区间"
+            result["level"] = "optimal"
+        elif acwr <= 1.5:
+            result["status"] = "受伤风险升高"
+            result["level"] = "high"
+        else:
+            result["status"] = "极高风险"
+            result["level"] = "very_high"
+
+    return result
+
+
+# ───────────────────────────────────────────────────────────────
+# 2c. Race Info（目标赛事倒计时）
+# ───────────────────────────────────────────────────────────────
+
+_RACE_DEFAULTS = {
+    "race_name": "北京马拉松",
+    "race_date": "2026-10-18",
+    "race_target": "2:55",
+}
+
+
+def _format_race_target(value: Any) -> str:
+    """将 canonical goal 的 HH:MM[:SS] 目标格式化为 H:MM。"""
+    text = str(value or "").strip()
+    parts = text.split(":")
+    if len(parts) not in (2, 3) or not all(part.isdigit() for part in parts):
+        return text
+    hours, minutes = int(parts[0]), int(parts[1])
+    seconds = int(parts[2]) if len(parts) == 3 else 0
+    if not 0 <= minutes < 60 or not 0 <= seconds < 60:
+        return text
+    return f"{hours}:{minutes:02d}"
+
+
+def get_race_info(
+    conn: sqlite3.Connection, *, goal: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """获取目标赛事信息。
+
+    传入 canonical ``goal`` 时只读其主赛字段；无 goal 时才兼容旧 settings/default。
+    """
+    from engine.database import get_setting
+
+    if goal is None:
+        name = get_setting(conn, "race_name") or _RACE_DEFAULTS["race_name"]
+        race_date_str = get_setting(conn, "race_date") or _RACE_DEFAULTS["race_date"]
+        target = get_setting(conn, "race_target") or _RACE_DEFAULTS["race_target"]
+    else:
+        name = str(goal.get("primary_race") or "")
+        race_date_str = str(goal.get("primary_race_date") or "")
+        target = _format_race_target(goal.get("a_target_time"))
+
+    info: Dict[str, Any] = {
+        "name": name,
+        "date": race_date_str,
+        "target": target,
+        "days_left": None,
+        "weeks_left": None,
+    }
+    try:
+        rd = date.fromisoformat(race_date_str)
+        delta = (rd - date.today()).days
+        if delta >= 0:
+            info["days_left"] = delta
+            info["weeks_left"] = round(delta / 7.0, 1)
+    except ValueError:
+        pass
+    return info
 
 
 # ───────────────────────────────────────────────────────────────
@@ -756,6 +964,19 @@ def get_metric_comparisons(conn: sqlite3.Connection) -> Dict[str, Any]:
     rhr_7d = _avg("resting_hr")
     sleep_7d = _avg("sleep_hours")
 
+    # 7 日基线范围 (mean ± SD)
+    def _range(fld):
+        vals = [_safe_float(r[fld]) for r in hist if _safe_float(r[fld]) is not None]
+        if len(vals) >= 3:
+            m = statistics.mean(vals)
+            s = statistics.stdev(vals)
+            return {"low": round(m - s, 1), "high": round(m + s, 1)}
+        return None
+
+    hrv_range = _range("hrv")
+    rhr_range = _range("resting_hr")
+    sleep_range = _range("sleep_hours")
+
     # Fitness
     fit_row = conn.execute(
         "SELECT ctl, atl, tsb FROM fitness_history ORDER BY date DESC LIMIT 1"
@@ -766,10 +987,15 @@ def get_metric_comparisons(conn: sqlite3.Connection) -> Dict[str, Any]:
     monday = date.today() - timedelta(days=date.today().weekday())
     sunday = monday + timedelta(days=6)
     week_tss_row = conn.execute(
-        "SELECT COALESCE(SUM(tss), 0) as total FROM activities WHERE date >= ? AND date <= ?",
+        "SELECT SUM(tss) as total, COUNT(*) as activity_count, COUNT(tss) as tss_count FROM activities WHERE date >= ? AND date <= ?",
         (monday.isoformat(), sunday.isoformat()),
     ).fetchone()
-    week_actual_tss = week_tss_row["total"] if week_tss_row else 0
+    week_actual_tss = (
+        week_tss_row["total"]
+        if week_tss_row and week_tss_row["activity_count"] > 0
+        and week_tss_row["activity_count"] == week_tss_row["tss_count"]
+        else None
+    )
 
     week_planned_tss_row = conn.execute(
         "SELECT COALESCE(SUM(target_tss), 0) as total FROM planned_workouts WHERE date >= ? AND date <= ? AND sport NOT IN ('rest', 'stretch')",
@@ -779,16 +1005,26 @@ def get_metric_comparisons(conn: sqlite3.Connection) -> Dict[str, Any]:
 
     # 7 日训练次数 + 总时长 + 总 TSS + 高强度天数
     week_activity_count = conn.execute(
-        "SELECT COUNT(*) as c FROM activities WHERE date >= ?",
+        """SELECT COUNT(DISTINCT COALESCE('p:' || l.planned_workout_id, 'a:' || a.id)) as c
+             FROM activities a
+             LEFT JOIN planned_workout_activity_links l ON l.activity_id=a.id
+            WHERE a.date >= ?""",
         (week_ago,),
     ).fetchone()["c"]
 
     week_totals = conn.execute(
-        "SELECT COALESCE(SUM(total_timer_s), 0) as total_s, COALESCE(SUM(tss), 0) as total_tss FROM activities WHERE date >= ?",
+        """SELECT COALESCE(SUM(total_timer_s), 0) as total_s, SUM(tss) as total_tss,
+                  COUNT(*) as activity_count, COUNT(tss) as tss_count
+             FROM activities WHERE date >= ?""",
         (week_ago,),
     ).fetchone()
     week_total_hours = round(week_totals["total_s"] / 3600, 1) if week_totals else 0
-    week_total_tss = round(week_totals["total_tss"], 0) if week_totals else 0
+    week_total_tss = (
+        round(week_totals["total_tss"], 0)
+        if week_totals and week_totals["activity_count"] > 0
+        and week_totals["activity_count"] == week_totals["tss_count"]
+        else None
+    )
 
     # 高强度天：当天有 IF >= 0.85 或 TSS >= 100 的活动
     high_intensity_rows = conn.execute(
@@ -801,7 +1037,11 @@ def get_metric_comparisons(conn: sqlite3.Connection) -> Dict[str, Any]:
 
     # 各运动类型次数
     sport_counts_rows = conn.execute(
-        "SELECT sport, COUNT(*) as c FROM activities WHERE date >= ? GROUP BY sport",
+        """SELECT a.sport,
+                  COUNT(DISTINCT COALESCE('p:' || l.planned_workout_id, 'a:' || a.id)) as c
+             FROM activities a
+             LEFT JOIN planned_workout_activity_links l ON l.activity_id=a.id
+            WHERE a.date >= ? GROUP BY a.sport""",
         (week_ago,),
     ).fetchall()
     sport_counts = {r["sport"]: r["c"] for r in sport_counts_rows}
@@ -811,6 +1051,7 @@ def get_metric_comparisons(conn: sqlite3.Connection) -> Dict[str, Any]:
             "value": _safe_float(w.get("hrv")),
             "unit": "ms",
             "avg_7d": hrv_7d,
+            "range_7d": hrv_range,
             "delta_7d": round(_safe_float(w.get("hrv")) - hrv_7d, 1) if _safe_float(w.get("hrv")) and hrv_7d else None,
             "date": w_date,
             "source": "Garmin",
@@ -820,6 +1061,7 @@ def get_metric_comparisons(conn: sqlite3.Connection) -> Dict[str, Any]:
             "score": _safe_float(w.get("sleep_score")),
             "unit": "h",
             "avg_7d": sleep_7d,
+            "range_7d": sleep_range,
             "delta_7d": round(_safe_float(w.get("sleep_hours")) - sleep_7d, 2) if _safe_float(w.get("sleep_hours")) and sleep_7d else None,
             "date": w_date,
             "source": "Garmin",
@@ -828,6 +1070,7 @@ def get_metric_comparisons(conn: sqlite3.Connection) -> Dict[str, Any]:
             "value": _safe_float(w.get("resting_hr")),
             "unit": "bpm",
             "avg_7d": rhr_7d,
+            "range_7d": rhr_range,
             "delta_7d": round(_safe_float(w.get("resting_hr")) - rhr_7d, 1) if _safe_float(w.get("resting_hr")) and rhr_7d else None,
             "date": w_date,
             "source": "Garmin",
@@ -838,9 +1081,10 @@ def get_metric_comparisons(conn: sqlite3.Connection) -> Dict[str, Any]:
             "tsb": _safe_float(fitness.get("tsb")),
         },
         "week_tss": {
-            "actual": round(week_actual_tss, 1),
+            "actual": round(week_actual_tss, 1) if week_actual_tss is not None else None,
             "planned": round(week_planned_tss, 1),
-            "pct": round(week_actual_tss / week_planned_tss * 100, 1) if week_planned_tss > 0 else 0,
+            "pct": round(week_actual_tss / week_planned_tss * 100, 1)
+                   if week_actual_tss is not None and week_planned_tss > 0 else None,
         },
         "week_activity": {
             "count": week_activity_count,

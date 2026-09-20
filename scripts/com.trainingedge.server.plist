@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.trainingedge.server</string>
+
+    <!-- 代码与运行时均必须来自本机路径；安装器会拒绝 OneDrive 代码副本。 -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__RUNTIME__/venv/bin/python</string>
+        <string>scripts/cli.py</string>
+        <string>serve</string>
+        <string>--port</string>
+        <string>8420</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__PROJECT__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+    </dict>
+
+    <!-- 崩溃 / 休眠唤醒后自动拉起 -->
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- 防止崩溃风暴：两次拉起至少间隔 10 秒 -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>__RUNTIME__/logs/server.log</string>
+    <key>StandardErrorPath</key>
+    <string>__RUNTIME__/logs/server.err.log</string>
+</dict>
+</plist>

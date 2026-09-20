@@ -9,19 +9,23 @@ build/
 # Environment
 .env
 
-# Local state (DB, FIT files, logs)
+# Local state (DB, FIT files, logs) — 运行时数据应放在 OneDrive 外，见 README
 state/*.db
 state/*.db-shm
 state/*.db-wal
+state/*.db.bak*
+state/.server.pid
 state/fit_files/
 state/tokens/
 data/
 data/*.db
 data/*.db-shm
 data/*.db-wal
+data/*.db.bak*
 data/fit_files/
 data/tokens/
 *.log
+training_edge.db
 
 # NAS deploy data
 nas-deploy-data/

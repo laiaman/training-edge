@@ -21,6 +21,9 @@ async def verify_api_key(request: Request):
     Checks X-API-Key header or api_key query param.
     Skips auth if no API key is configured (dev mode).
     """
+    if getattr(request.state, "web_authenticated", False):
+        return
+
     database.init_db()
     with database.get_db() as conn:
         stored_key = database.get_setting(conn, 'api_key')

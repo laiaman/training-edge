@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import calendar
+import copy
 import json
 import logging
 from datetime import date, datetime, timedelta
@@ -13,6 +15,7 @@ import hashlib
 import hmac
 import os
 import secrets
+import uuid
 
 logger = logging.getLogger(__name__)
 
@@ -22,12 +25,13 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from engine import database, metrics, validator
+from engine import database, metrics, validator, plan_store
 from engine.auth import verify_api_key, get_or_create_api_key
 from engine.readiness import (
     compute_readiness, compute_weekly_deviation,
     compute_body_trend_summary, get_metric_comparisons,
     get_body_comp_comparisons, compute_decision_summary,
+    compute_acwr, get_race_info,
 )
 
 # ---------------------------------------------------------------------------
@@ -49,6 +53,15 @@ _ACCESS_PASSWORD = os.environ.get("TRAININGEDGE_PASSWORD", "")
 _SESSION_SECRET = os.environ.get("TRAININGEDGE_SESSION_SECRET", secrets.token_hex(32))
 _AUTH_COOKIE = "oc_session"
 _PUBLIC_PATHS = {"/api/health", "/login", "/static"}
+# 只读决策 API — 供教练 Skills / 本地脚本调用，无需登录（写操作仍受 API Key 保护）
+_PUBLIC_API_PREFIXES = (
+    "/api/readiness",
+    "/api/weekly-deviation",
+    "/api/decision-summary",
+    "/api/acwr",
+    "/api/race-info",
+    "/api/body-trend-summary",
+)
 
 
 def _make_session_token(password: str) -> str:
@@ -62,12 +75,15 @@ class AccessGateMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         # Skip if no password configured (local/dev mode)
         if not _ACCESS_PASSWORD:
+            request.state.web_authenticated = True
             return await call_next(request)
 
         path = request.url.path
 
         # Allow public paths
         if any(path.startswith(p) for p in _PUBLIC_PATHS):
+            return await call_next(request)
+        if any(path.startswith(p) for p in _PUBLIC_API_PREFIXES):
             return await call_next(request)
 
         # Allow API calls with valid API key
@@ -80,6 +96,7 @@ class AccessGateMiddleware(BaseHTTPMiddleware):
         session = request.cookies.get(_AUTH_COOKIE, "")
         expected = _make_session_token(_ACCESS_PASSWORD)
         if hmac.compare_digest(session, expected):
+            request.state.web_authenticated = True
             return await call_next(request)
 
         # Not authenticated → redirect to login
@@ -93,7 +110,48 @@ STATIC_DIR = BASE_DIR / "web" / "static"
 TEMPLATES_DIR = BASE_DIR / "web" / "templates"
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
-templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+
+NAVIGATION_ITEMS = (
+    {"key": "dashboard", "label": "面板", "href": "/", "description": "训练状态与近期执行概览"},
+    {"key": "body", "label": "身体数据", "href": "/body-data", "description": "恢复、体重与健康趋势"},
+    {"key": "goal", "label": "目标与周期", "href": "/goal", "description": "赛事目标、配速区间与周期分期"},
+    {"key": "plan", "label": "训练计划", "href": "/plan", "description": "月/周课表与计划调整"},
+    {"key": "settings", "label": "设置", "href": "/settings", "description": "模型、档案、同步与界面配置"},
+)
+DEFAULT_NAVIGATION_ORDER = [item["key"] for item in NAVIGATION_ITEMS]
+
+
+def _ordered_navigation_items(raw_order: Any = None, *, strict: bool = False) -> List[Dict[str, str]]:
+    try:
+        order = json.loads(raw_order) if isinstance(raw_order, str) else raw_order
+    except json.JSONDecodeError as exc:
+        if strict:
+            raise ValueError("导航排序必须是 JSON 数组") from exc
+        order = None
+    valid = (
+        isinstance(order, list)
+        and len(order) == len(DEFAULT_NAVIGATION_ORDER)
+        and len(set(order)) == len(order)
+        and set(order) == set(DEFAULT_NAVIGATION_ORDER)
+    )
+    if not valid:
+        if strict and order is not None:
+            raise ValueError("导航排序必须且只能包含全部现有 Tab")
+        order = DEFAULT_NAVIGATION_ORDER
+    by_key = {item["key"]: item for item in NAVIGATION_ITEMS}
+    return [dict(by_key[key]) for key in order]
+
+
+def _navigation_context(_: Request) -> Dict[str, Any]:
+    with database.get_db() as conn:
+        raw_order = database.get_setting(conn, "navigation_order")
+    return {"navigation_items": _ordered_navigation_items(raw_order)}
+
+
+templates = Jinja2Templates(
+    directory=str(TEMPLATES_DIR),
+    context_processors=[_navigation_context],
+)
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +206,12 @@ async def _auto_sync_loop():
 @app.on_event("startup")
 def startup():
     database.init_db()
+    try:
+        with database.get_db() as conn:
+            plan_store.sync_plan_to_db(conn, plan_store.load_plan())
+            database.reconcile_all_compliance(conn)
+    except plan_store.PlanStoreError as exc:
+        logger.error("[plan-store] startup sync paused: %s", exc)
 
     global _sync_task
     if _SYNC_INTERVAL_HOURS > 0:
@@ -166,7 +230,7 @@ def startup():
 async def login_page(request: Request, next: str = "/", error: str = ""):
     if not _ACCESS_PASSWORD:
         return RedirectResponse("/")
-    return templates.TemplateResponse("login.html", {
+    return templates.TemplateResponse(request=request, name="login.html", context={
         "request": request, "next": next, "error": error,
     })
 
@@ -486,6 +550,29 @@ def api_decision_summary():
     return {"ok": True, **result}
 
 
+@app.get("/api/acwr")
+def api_acwr():
+    """ACWR 急慢性负荷比（近7天 vs 近28天日均 TSS）。"""
+    with database.get_db() as conn:
+        result = compute_acwr(conn)
+    return {"ok": True, **result}
+
+
+@app.get("/api/race-info")
+def api_race_info():
+    """目标赛事倒计时（canonical training_plan.goal 为唯一真源）。"""
+    try:
+        document = plan_store.load_plan()
+    except plan_store.PlanStoreError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    goal = document.get("goal")
+    if not isinstance(goal, dict):
+        raise HTTPException(503, "结构化计划缺少 goal")
+    with database.get_db() as conn:
+        result = get_race_info(conn, goal=goal)
+    return {"ok": True, **result}
+
+
 @app.get("/api/constraint-status")
 def api_constraint_status():
     """本周计划约束满足情况检查。
@@ -511,6 +598,16 @@ def api_constraint_status():
             (monday.isoformat(), sunday.isoformat()),
         ).fetchall()
         activities = [dict(a) for a in activities]
+        linked_activity_ids = {
+            str(row["activity_id"])
+            for row in conn.execute(
+                """SELECT l.activity_id
+                     FROM planned_workout_activity_links l
+                     JOIN planned_workouts pw ON pw.id=l.planned_workout_id
+                    WHERE pw.date >= ? AND pw.date <= ?""",
+                (monday.isoformat(), sunday.isoformat()),
+            ).fetchall()
+        }
 
         # 获取当前训练阶段约束
         try:
@@ -534,7 +631,13 @@ def api_constraint_status():
     rest_count_actual = len(rest_dates_actual)
 
     sport_actual: Dict[str, int] = {}
+    for workout in workouts:
+        if (workout.get("actual_activity_count") or 0) > 0:
+            sport = workout.get("sport", "unknown")
+            sport_actual[sport] = sport_actual.get(sport, 0) + 1
     for a in activities:
+        if str(a.get("id")) in linked_activity_ids:
+            continue
         s = a.get("sport", "unknown")
         sport_actual[s] = sport_actual.get(s, 0) + 1
 
@@ -548,54 +651,55 @@ def api_constraint_status():
         d = w.get("date", "")[:10]
         daily_planned_tss[d] = daily_planned_tss.get(d, 0) + (w.get("target_tss") or 0)
 
-    # ── 约束1: 周一休息 ──
-    monday_str = monday.isoformat()
-    monday_has_activity = monday_str in active_dates
-    if monday_str in passed_dates:
-        status = "met" if not monday_has_activity else "unmet"
-        detail = "周一已休息" if not monday_has_activity else "周一有训练活动，未满足休息要求"
-    else:
-        status = "in_progress"
-        detail = "周一尚未到来"
-    constraints.append({"rule": "周一休息", "status": status, "detail": detail})
-
-    # ── 约束2: 每周 3-4 次骑行 ──
-    cycling_count = sport_actual.get("cycling", 0)
+    # ── 约束1: 跑步执行频率 ──
+    running_count = sum(sport_actual.get(sport, 0) for sport in ("running", "trail_running", "treadmill_running"))
+    planned_running_count = sum(1 for w in workouts if w.get("sport") == "running")
+    running_target = max(1, planned_running_count)
     if week_done:
-        status = "met" if 3 <= cycling_count <= 4 else "unmet"
+        status = "met" if running_count >= running_target else "unmet"
     else:
-        status = "met" if cycling_count >= 3 else "in_progress"
+        status = "met" if running_count >= running_target else "in_progress"
     constraints.append({
-        "rule": "每周 3-4 次骑行",
+        "rule": "按周计划完成跑步",
         "status": status,
-        "detail": f"已完成 {cycling_count} 次骑行",
+        "detail": f"已完成 {running_count}/{running_target} 次",
     })
 
-    # ── 约束3: 每周至少 1 次跑步 ──
-    running_count = sport_actual.get("running", 0)
-    if week_done:
-        status = "met" if running_count >= 1 else "unmet"
-    else:
-        status = "met" if running_count >= 1 else "in_progress"
+    # ── 约束2: 周三质量课、周日长距离 ──
+    def _day_has_running(day: date, keywords: tuple[str, ...]) -> bool:
+        day_text = day.isoformat()
+        candidates = [w for w in workouts if w.get("date", "")[:10] == day_text and w.get("sport") == "running"]
+        if day <= today:
+            candidates += [a for a in activities if a.get("date", "")[:10] == day_text and a.get("sport") == "running"]
+        text = " ".join(f"{item.get('title', '')} {item.get('name', '')} {item.get('description', '')}" for item in candidates).lower()
+        return bool(candidates) and (not keywords or any(keyword in text for keyword in keywords))
+
+    wednesday = monday + timedelta(days=2)
+    sunday_run = monday + timedelta(days=6)
+    quality_ok = _day_has_running(wednesday, ("间歇", "cv", "阈值", "tempo", "马配", "质量"))
+    long_ok = _day_has_running(sunday_run, ("长", "long", "耐力"))
+    anchors_ok = quality_ok and long_ok
     constraints.append({
-        "rule": "每周至少 1 次跑步",
-        "status": status,
-        "detail": f"已完成 {running_count} 次跑步",
+        "rule": "周三质量课与周日长距离",
+        "status": "met" if anchors_ok else ("unmet" if week_done else "in_progress"),
+        "detail": f"周三{'已安排' if quality_ok else '待确认'}；周日{'已安排' if long_ok else '待确认'}",
     })
 
-    # ── 约束4: 每周 3-4 次力量 ──
+    # ── 约束3: 力量作为伤病预防辅助 ──
     strength_count = sport_actual.get("training", 0)
+    planned_strength_count = sum(1 for w in workouts if w.get("sport") == "training")
+    strength_target = planned_strength_count
     if week_done:
-        status = "met" if 3 <= strength_count <= 4 else "unmet"
+        status = "met" if strength_count >= strength_target else "unmet"
     else:
-        status = "met" if strength_count >= 3 else "in_progress"
+        status = "met" if strength_count >= strength_target else "in_progress"
     constraints.append({
-        "rule": "每周 3-4 次力量",
+        "rule": "力量与伤病预防",
         "status": status,
-        "detail": f"已完成 {strength_count} 次力量训练",
+        "detail": f"已完成 {strength_count}/{strength_target} 次",
     })
 
-    # ── 约束5: 避免连续 3 天高负荷 ──
+    # ── 约束4: 避免连续 3 天高负荷 ──
     max_consecutive_high = 2
     high_tss_threshold = 80
     consecutive_high = 0
@@ -620,23 +724,21 @@ def api_constraint_status():
         "detail": detail,
     })
 
-    # ── 约束6: 骑行强度课后次日不安排腿部大重量 ──
-    # 检查高强度骑行日的次日是否有力量训练
-    intensity_ride_dates = set()
+    # ── 约束5: 跑步质量课后次日不安排下肢大重量 ──
+    intensity_dates = set()
     for w in workouts:
-        if w.get("sport") == "cycling":
+        if w.get("sport") == "running":
             intensity = (w.get("target_intensity") or "").lower()
             title = (w.get("title") or "").lower()
             if any(k in intensity for k in ("z4", "z5", "vo2", "threshold")) or "间歇" in title or "关键" in title:
-                intensity_ride_dates.add(w.get("date", "")[:10])
-    # 也检查实际高强度骑行
+                intensity_dates.add(w.get("date", "")[:10])
     for a in activities:
-        if a.get("sport") == "cycling" and (a.get("tss") or 0) >= 80:
-            intensity_ride_dates.add(a.get("date", "")[:10])
+        if a.get("sport") == "running" and (a.get("tss") or 0) >= 80:
+            intensity_dates.add(a.get("date", "")[:10])
 
     leg_conflict = False
-    for ride_date_str in intensity_ride_dates:
-        next_day = (date.fromisoformat(ride_date_str) + timedelta(days=1)).isoformat()
+    for intensity_date_str in intensity_dates:
+        next_day = (date.fromisoformat(intensity_date_str) + timedelta(days=1)).isoformat()
         # 检查次日是否有力量训练（含腿部）
         for w in workouts:
             if w.get("date", "")[:10] == next_day and w.get("sport") == "training":
@@ -645,26 +747,10 @@ def api_constraint_status():
                 if any(k in mg or k in title for k in ("quad", "leg", "hamstr", "glute", "下肢", "腿", "臀")):
                     leg_conflict = True
     constraints.append({
-        "rule": "强度骑后次日不安排腿部大重量",
+        "rule": "质量跑后次日不安排下肢大重量",
         "status": "unmet" if leg_conflict else "met",
         "detail": "存在冲突" if leg_conflict else "当前满足",
     })
-
-    # ── 约束7: 每周总时长 10-12 小时 ──
-    total_planned_min = sum(w.get("target_duration_min") or 0 for w in workouts)
-    total_planned_hrs = total_planned_min / 60
-    if total_planned_min > 0:
-        if 10 <= total_planned_hrs <= 12:
-            status = "met"
-        elif total_planned_hrs < 10:
-            status = "in_progress" if not week_done else "unmet"
-        else:
-            status = "unmet"
-        constraints.append({
-            "rule": "每周总时长 10-12 小时",
-            "status": status,
-            "detail": f"计划 {total_planned_hrs:.1f}h",
-        })
 
     return {"ok": True, "week_start": monday.isoformat(), "week_end": sunday.isoformat(), "constraints": constraints}
 
@@ -677,10 +763,11 @@ def api_constraint_status():
 def dashboard(request: Request):
     """Main dashboard page — v1 Decision Cockpit."""
     with database.get_db() as conn:
-        activities = database.list_activities(conn, days=365, limit=100)
+        activities = [
+            activity for activity in database.list_activities(conn, days=365, limit=200)
+            if activity.get("sport") in {"running", "training"}
+        ][:100]
         fitness = database.list_fitness_history(conn, days=180)
-        pdc_season = database.get_pdc_bests(conn, days=90)
-        pdc_alltime = database.get_pdc_bests(conn, days=9999)
         val = validator.validation_dashboard(30)
         wk_stats = database.weekly_stats(conn)
         wellness = database.list_wellness(conn, days=30)
@@ -690,13 +777,60 @@ def dashboard(request: Request):
         deviation = compute_weekly_deviation(conn)
         metric_cards = get_metric_comparisons(conn)
         decision_summary = compute_decision_summary(conn)
+        acwr = compute_acwr(conn)
+        try:
+            document = plan_store.load_plan()
+        except plan_store.PlanStoreError as exc:
+            raise HTTPException(503, str(exc)) from exc
+        race_info = get_race_info(conn, goal=document.get("goal"))
 
-    return templates.TemplateResponse("dashboard.html", {
-        "request": request,
+        # 今日计划训练
+        from datetime import date as _date
+        today_iso = _date.today().isoformat()
+        today_planned = conn.execute(
+            "SELECT * FROM planned_workouts WHERE date = ? AND sport NOT IN ('rest','stretch') ORDER BY id",
+            (today_iso,),
+        ).fetchall()
+        today_plan = [dict(p) for p in today_planned] if today_planned else []
+
+        # 活动 → 计划匹配（为最近活动表关联计划名称）
+        plan_match_map = {}
+        matched_rows = conn.execute(
+            """SELECT l.activity_id, pw.title AS plan_title, pw.compliance_status
+               FROM planned_workout_activity_links l
+               JOIN planned_workouts pw ON pw.id=l.planned_workout_id"""
+        ).fetchall()
+        for mr in matched_rows:
+            try:
+                plan_match_map[int(mr["activity_id"])] = {
+                    "title": mr["plan_title"], "status": mr["compliance_status"]
+                }
+            except (ValueError, TypeError):
+                pass
+
+        # 注入匹配信息到 activities + 跑步配速
+        for act in activities:
+            pm = plan_match_map.get(act["id"])
+            if pm:
+                act["plan_title"] = pm["title"]
+                act["plan_match"] = "match"
+            else:
+                act["plan_title"] = None
+                act["plan_match"] = None
+
+            # 跑步配速（min/km），力量训练为 None
+            act["pace_str"] = None
+            if (act.get("sport") or "").lower() in ("running", "trail_running", "treadmill_running"):
+                dist = act.get("distance_m") or 0
+                dur = act.get("total_timer_s") or 0
+                if dist > 100 and dur > 0:
+                    sec_per_km = dur / (dist / 1000.0)
+                    act["pace_str"] = f"{int(sec_per_km // 60)}'{int(sec_per_km % 60):02d}\""
+
+    return templates.TemplateResponse(
+        request=request, name="dashboard.html", context={
         "activities": activities,
         "fitness": fitness,
-        "pdc_season": pdc_season,
-        "pdc_alltime": pdc_alltime,
         "validation": val,
         "weekly": wk_stats,
         "wellness": wellness,
@@ -705,6 +839,9 @@ def dashboard(request: Request):
         "deviation": deviation.to_dict(),
         "metric_cards": metric_cards,
         "decision_summary": decision_summary,
+        "today_plan": today_plan,
+        "acwr": acwr,
+        "race_info": race_info,
     })
 
 
@@ -733,7 +870,7 @@ def activity_detail(request: Request, activity_id: int):
     laps = json.loads(activity["laps_json"]) if activity.get("laps_json") else []
     validation = json.loads(activity["validation_json"]) if activity.get("validation_json") else None
 
-    return templates.TemplateResponse("activity.html", {
+    return templates.TemplateResponse(request=request, name="activity.html", context={
         "request": request,
         "activity": activity,
         "records": records,
@@ -746,9 +883,356 @@ def activity_detail(request: Request, activity_id: int):
     })
 
 
+def _parse_target_time(value: str) -> int:
+    try:
+        hours, minutes, seconds = (int(part) for part in value.split(":"))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise HTTPException(422, "目标时间格式必须为 HH:MM:SS") from exc
+    if hours < 1 or not 0 <= minutes < 60 or not 0 <= seconds < 60:
+        raise HTTPException(422, "目标时间超出有效范围")
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def _format_pace(seconds: float) -> str:
+    # Goal pace is a ceiling: rounding up could make the displayed pace miss the target.
+    whole_seconds = max(1, int(seconds))
+    return f"{whole_seconds // 60:02d}:{whole_seconds % 60:02d}"
+
+
+def _pace_range(base_seconds: float, lower_offset: int, upper_offset: int) -> str:
+    return f"{_format_pace(base_seconds + lower_offset)}-{_format_pace(base_seconds + upper_offset)}"
+
+
+def _replace_pace_value(value: Any, old_pace: str, new_pace: str, old_display: str, new_display: str) -> Any:
+    if isinstance(value, str):
+        return value.replace(old_pace, new_pace).replace(old_display, new_display)
+    if isinstance(value, list):
+        return [_replace_pace_value(item, old_pace, new_pace, old_display, new_display) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _replace_pace_value(item, old_pace, new_pace, old_display, new_display)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _build_pace_zones(target_seconds: int) -> Dict[str, Dict[str, str]]:
+    marathon_pace = target_seconds / 42.195
+    return {
+        "recovery": {"pace": _pace_range(marathon_pace, 82, 112), "hr": "<120", "rpe": "1-2"},
+        "easy": {"pace": _pace_range(marathon_pace, 52, 92), "hr": "120-140", "rpe": "3-4"},
+        "aerobic_tempo": {"pace": _pace_range(marathon_pace, 27, 42), "hr": "135-145", "rpe": "5"},
+        "steady": {"pace": _pace_range(marathon_pace, 12, 27), "hr": "145-155", "rpe": "6"},
+        "marathon": {"pace": _pace_range(marathon_pace, 0, 5), "hr": "148-162", "rpe": "7-8"},
+        "cv": {"pace": _pace_range(marathon_pace, -23, -18), "hr": "160-170", "rpe": "7-9"},
+        "interval": {"pace": _pace_range(marathon_pace, -33, -23), "hr": "165-175", "rpe": "8-9"},
+        "strides": {"pace": _pace_range(marathon_pace, -48, -28), "hr": "170+", "rpe": "9-10"},
+    }
+
+
+def _phase_for_date(workout_date: date, race_date: date) -> str:
+    days_left = (race_date - workout_date).days
+    if days_left < 0:
+        return "赛后恢复期"
+    if days_left == 0:
+        return "比赛日"
+    if days_left <= 14:
+        return "减量期"
+    if days_left <= 42:
+        return "巅峰专项期"
+    if days_left <= 84:
+        return "专项构建期"
+    return "基础整合期"
+
+
+PACE_ZONE_DESCRIPTIONS = {
+    "recovery": {"label": "恢复跑", "description": "疲劳日或高强度课后使用，以促进恢复为目的。"},
+    "easy": {"label": "轻松有氧", "description": "建立有氧基础和累计跑量，应能轻松交谈。"},
+    "aerobic_tempo": {"label": "有氧节奏", "description": "基础期长跑前段的可持续有氧强度。"},
+    "steady": {"label": "稳态跑", "description": "介于轻松跑和马配之间，强化持续有氧耐力。"},
+    "marathon": {"label": "马拉松配速", "description": "目标比赛专项强度，用于马配巡航和长跑后段。"},
+    "cv": {"label": "CV／乳酸阈", "description": "可控的快，提升乳酸清除和阈值能力，不追求力竭。"},
+    "interval": {"label": "短间歇", "description": "提升 VO₂max 与速度耐力，需严格控制总量和恢复。"},
+    "strides": {"label": "冲刺／神经激活", "description": "短时快速且充分恢复，用于神经肌肉唤醒。"},
+}
+
+
+@app.get("/goal", response_class=HTMLResponse)
+def goal_page(request: Request):
+    try:
+        document = plan_store.load_plan()
+    except plan_store.PlanStoreError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    return templates.TemplateResponse(request=request, name="goal.html", context={
+        "request": request,
+        "goal": document["goal"],
+        "pace_zones": document.get("pace_zones", {}),
+        "pace_zone_descriptions": PACE_ZONE_DESCRIPTIONS,
+        "plan_revision": document["revision"],
+    })
+
+
+@app.post("/api/goal-impact-proposals", dependencies=[Depends(verify_api_key)])
+async def api_goal_impact_proposal(request: Request):
+    data = await request.json()
+    document = plan_store.load_plan()
+    if data.get("expected_revision") != document["revision"]:
+        raise HTTPException(409, "计划已更新，请刷新后重新预览影响")
+    draft = data.get("goal") or {}
+    target_seconds = _parse_target_time(draft.get("a_target_time", ""))
+    try:
+        race_date = date.fromisoformat(draft.get("primary_race_date", ""))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(422, "主赛日期格式必须为 YYYY-MM-DD") from exc
+    goal_patch = {
+        key: draft[key] for key in (
+            "primary_race", "primary_race_date", "secondary_race",
+            "secondary_race_date", "a_target_time", "b_target_time", "priority",
+        ) if key in draft
+    }
+    goal_patch["marathon_pace"] = _format_pace(target_seconds / 42.195)
+
+    future_workouts = [
+        workout for workout in document.get("workouts", [])
+        if workout.get("date", "") >= date.today().isoformat()
+    ]
+    phase_by_uid = {
+        workout["uid"]: _phase_for_date(date.fromisoformat(workout["date"]), race_date)
+        for workout in future_workouts
+    }
+    secondary_date_text = goal_patch.get("secondary_race_date") or document["goal"].get("secondary_race_date")
+    try:
+        secondary_date = date.fromisoformat(secondary_date_text) if secondary_date_text else race_date
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(422, "备选赛日期格式必须为 YYYY-MM-DD") from exc
+    plan_end = max(race_date, secondary_date)
+    changes: List[Dict[str, Any]] = [
+        {
+            "kind": "goal", "patch": goal_patch, "label": "赛事目标",
+            "before": document["goal"], "after": goal_patch,
+        },
+        {
+            "kind": "pace_zones", "value": _build_pace_zones(target_seconds), "label": "配速区间",
+            "before": document.get("pace_zones", {}), "after": _build_pace_zones(target_seconds),
+        },
+        {
+            "kind": "phase_partition", "plan_patch": {"end_date": plan_end.isoformat()},
+            "phase_by_uid": phase_by_uid, "label": "周期分期",
+            "before": {"future_workouts": len(future_workouts)},
+            "after": {"race_date": race_date.isoformat(), "future_workouts": len(phase_by_uid)},
+        },
+    ]
+    old_pace = document["goal"].get("marathon_pace", "")
+    new_pace = goal_patch["marathon_pace"]
+    replacements = []
+    if old_pace and old_pace != new_pace:
+        old_display = f"{int(old_pace[:2])}'{old_pace[-2:]}\""
+        new_display = f"{int(new_pace[:2])}'{new_pace[-2:]}\""
+        for workout in future_workouts:
+            patch = {}
+            for field in ("description", "target_intensity", "target_pace_text", "steps"):
+                value = workout.get(field)
+                replaced = _replace_pace_value(value, old_pace, new_pace, old_display, new_display)
+                if replaced != value:
+                    patch[field] = replaced
+            if patch:
+                replacements.append({"uid": workout["uid"], "patch": patch})
+    changes.append({
+        "kind": "workout_batch", "changes": replacements, "label": "未来课表中的目标马配",
+        "before": {"affected": len(replacements), "pace": old_pace},
+        "after": {"affected": len(replacements), "pace": new_pace},
+    })
+    with database.get_db() as conn:
+        cursor = conn.execute(
+            """INSERT INTO plan_change_proposals (base_revision, status, reason, changes_json)
+               VALUES (?, 'pending', ?, ?)""",
+            (document["revision"], "目标调整影响预览", json.dumps(changes, ensure_ascii=False)),
+        )
+        proposal_id = int(cursor.lastrowid)
+    return {"ok": True, "proposal_id": proposal_id, "base_revision": document["revision"], "changes": changes}
+
+
 @app.get("/plan", response_class=HTMLResponse)
+def running_plan_page(
+    request: Request,
+    view: str = "month",
+    month: Optional[str] = None,
+    week: Optional[str] = None,
+):
+    """Running-first month calendar with an optional detailed week view."""
+    if view not in {"month", "week"}:
+        raise HTTPException(400, "view 必须为 month 或 week")
+    today = date.today()
+    try:
+        if view == "week":
+            reference = date.fromisoformat(week) if week else today
+            range_start = reference - timedelta(days=reference.weekday())
+            range_end = range_start + timedelta(days=6)
+            month_reference = reference.replace(day=1)
+        else:
+            month_reference = datetime.strptime(month, "%Y-%m").date() if month else today.replace(day=1)
+            first_day = month_reference
+            last_day = month_reference.replace(day=calendar.monthrange(month_reference.year, month_reference.month)[1])
+            range_start = first_day - timedelta(days=first_day.weekday())
+            range_end = last_day + timedelta(days=6 - last_day.weekday())
+    except ValueError as exc:
+        raise HTTPException(400, "日期格式无效") from exc
+
+    if view == "month":
+        summary_start, summary_end = first_day, last_day
+        summary_scope_label = "本月"
+    else:
+        summary_start, summary_end = range_start, range_end
+        summary_scope_label = "本周"
+
+    with database.get_db() as conn:
+        database.match_compliance(conn, None)
+        workouts = database.list_planned_workouts(conn, range_start.isoformat(), range_end.isoformat())
+        activities = [dict(row) for row in conn.execute(
+            "SELECT * FROM activities WHERE date>=? AND date<=? ORDER BY date, start_time",
+            (range_start.isoformat(), range_end.isoformat()),
+        ).fetchall()]
+        linked_activity_rows = conn.execute(
+            """SELECT l.planned_workout_id,
+                      a.id, a.date, a.start_time, a.sport, a.name,
+                      a.distance_m, a.total_timer_s, a.avg_hr, a.max_hr,
+                      a.avg_cadence, a.total_ascent, a.aerobic_te,
+                      a.anaerobic_te, a.tss
+                 FROM planned_workout_activity_links l
+                 JOIN planned_workouts pw ON pw.id=l.planned_workout_id
+                 JOIN activities a ON a.id=l.activity_id
+                WHERE pw.date>=? AND pw.date<=?
+                ORDER BY pw.date, a.start_time, a.id""",
+            (range_start.isoformat(), range_end.isoformat()),
+        ).fetchall()
+        has_api_key = bool(database.get_setting(conn, "llm_api_key"))
+        readiness = compute_readiness(conn).to_dict()
+
+    try:
+        plan_document = plan_store.load_plan()
+    except plan_store.PlanStoreError as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+    linked_activities_by_workout: Dict[int, List[Dict[str, Any]]] = {}
+    for row in linked_activity_rows:
+        activity = dict(row)
+        workout_id = activity.pop("planned_workout_id")
+        distance_m = activity.get("distance_m") or 0
+        duration_s = activity.get("total_timer_s") or 0
+        activity["pace_seconds_per_km"] = (
+            duration_s / (distance_m / 1000.0)
+            if distance_m > 0 and duration_s > 0 else None
+        )
+        linked_activities_by_workout.setdefault(workout_id, []).append(activity)
+
+    workouts_by_date: Dict[str, List[Dict[str, Any]]] = {}
+    for workout in workouts:
+        try:
+            workout["steps"] = json.loads(workout.get("workout_steps_json") or "[]")
+        except (TypeError, json.JSONDecodeError):
+            workout["steps"] = []
+        workout["actual_activities"] = linked_activities_by_workout.get(workout["id"], [])
+        workouts_by_date.setdefault(workout["date"], []).append(workout)
+    activities_by_date: Dict[str, List[Dict[str, Any]]] = {}
+    for activity in activities:
+        activity_summary = {
+            key: activity.get(key) for key in (
+                "id", "date", "start_time", "sport", "name", "distance_m",
+                "total_timer_s", "avg_hr", "max_hr", "avg_cadence",
+            )
+        }
+        activities_by_date.setdefault((activity.get("date") or "")[:10], []).append(activity_summary)
+
+    days = []
+    cursor = range_start
+    while cursor <= range_end:
+        day_workouts = workouts_by_date.get(cursor.isoformat(), [])
+        days.append({
+            "date": cursor.isoformat(),
+            "day": cursor.day,
+            "day_name": ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][cursor.weekday()],
+            "in_month": cursor.month == month_reference.month,
+            "is_today": cursor == today,
+            "is_current_week": cursor - timedelta(days=cursor.weekday()) == today - timedelta(days=today.weekday()),
+            "workouts": day_workouts,
+            "activities": activities_by_date.get(cursor.isoformat(), []),
+        })
+        cursor += timedelta(days=1)
+
+    calendar_weeks = []
+    for index in range(0, len(days), 7):
+        week_days = days[index:index + 7]
+        week_workouts = [workout for day_item in week_days for workout in day_item["workouts"]]
+        running_workouts = [workout for workout in week_workouts if workout.get("sport") == "running"]
+        label = next((workout.get("week_label") for workout in week_workouts if workout.get("week_label")), "")
+        phase = next((workout.get("phase") for workout in week_workouts if workout.get("phase")), "")
+        calendar_weeks.append({
+            "days": week_days,
+            "label": label,
+            "phase": phase,
+            "is_current": any(day_item["is_current_week"] for day_item in week_days),
+            "planned_km": sum(workout.get("target_distance_km") or 0 for workout in running_workouts),
+            "completed": sum(1 for workout in week_workouts if workout.get("compliance_status") == "completed"),
+            "total": len([workout for workout in week_workouts if workout.get("sport") not in {"rest", "stretch"}]),
+        })
+
+    summary_workouts = [
+        workout for workout in workouts
+        if summary_start.isoformat() <= workout.get("date", "") <= summary_end.isoformat()
+    ]
+    summary_activities = [
+        activity for activity in activities
+        if summary_start.isoformat() <= (activity.get("date") or "")[:10] <= summary_end.isoformat()
+    ]
+    visible_running = [workout for workout in summary_workouts if workout.get("sport") == "running"]
+    actual_running = [
+        activity for activity in summary_activities
+        if activity.get("sport") in {"running", "trail_running", "treadmill_running"}
+    ]
+    key_workouts = [workout for workout in visible_running if workout.get("is_key_workout")]
+    summary = {
+        "planned_km": sum(workout.get("target_distance_km") or 0 for workout in visible_running),
+        "actual_km": sum(activity.get("distance_m") or 0 for activity in actual_running) / 1000.0,
+        "key_completed": sum(1 for workout in key_workouts if workout.get("compliance_status") == "completed"),
+        "key_partial": sum(1 for workout in key_workouts if workout.get("compliance_status") == "partial"),
+        "key_total": len(key_workouts),
+        "strength_total": sum(1 for workout in summary_workouts if workout.get("sport") == "training"),
+        "scope_label": summary_scope_label,
+    }
+    previous_month = (month_reference - timedelta(days=1)).replace(day=1)
+    next_month = (month_reference.replace(day=calendar.monthrange(month_reference.year, month_reference.month)[1]) + timedelta(days=1)).replace(day=1)
+    current_week_start = today - timedelta(days=today.weekday())
+
+    return templates.TemplateResponse(request=request, name="plan.html", context={
+        "request": request,
+        "view": view,
+        "month_value": month_reference.strftime("%Y-%m"),
+        "month_title": f"{month_reference.year}年{month_reference.month}月",
+        "previous_month": previous_month.strftime("%Y-%m"),
+        "next_month": next_month.strftime("%Y-%m"),
+        "range_start": range_start.isoformat(),
+        "range_end": range_end.isoformat(),
+        "calendar_weeks": calendar_weeks,
+        "week_days": days if view == "week" else [],
+        "current_week_start": current_week_start.isoformat(),
+        "selected_week_start": range_start.isoformat(),
+        "previous_week": (range_start - timedelta(days=7)).isoformat(),
+        "next_week": (range_start + timedelta(days=7)).isoformat(),
+        "summary": summary,
+        "plan_revision": plan_document["revision"],
+        "plan_info": plan_document["plan"],
+        "goal": plan_document["goal"],
+        "has_api_key": has_api_key,
+        "readiness": readiness,
+    })
+
+
+@app.get("/plan/legacy", response_class=HTMLResponse)
 def plan_page(request: Request, week: Optional[str] = None):
     """Training plan weekly calendar page."""
+    target = f"/plan?view=week&week={week}" if week else "/plan?view=week"
+    return RedirectResponse(target, status_code=307)
+
     ref = date.fromisoformat(week) if week else date.today()
     week_start = ref - timedelta(days=ref.weekday())  # Monday
     week_end = week_start + timedelta(days=6)          # Sunday
@@ -829,7 +1313,11 @@ def plan_page(request: Request, week: Optional[str] = None):
         ).fetchall()
         prev_activities = [dict(a) for a in prev_activities]
         prev_tss_planned = sum(w.get('target_tss') or 0 for w in prev_workouts)
-        prev_tss_actual = sum(a.get('tss') or 0 for a in prev_activities)
+        prev_tss_actual = (
+            sum(a['tss'] for a in prev_activities)
+            if prev_activities and all(a.get('tss') is not None for a in prev_activities)
+            else None
+        )
         prev_completed = sum(1 for w in prev_workouts if w.get('compliance_status') == 'completed')
         prev_total = len(prev_workouts)
 
@@ -861,7 +1349,11 @@ def plan_page(request: Request, week: Optional[str] = None):
         })
 
     week_tss_planned = sum(w.get('target_tss') or 0 for w in workouts)
-    week_tss_actual = sum(a.get('tss') or 0 for a in activities)
+    week_tss_actual = (
+        sum(a['tss'] for a in activities)
+        if activities and all(a.get('tss') is not None for a in activities)
+        else None
+    )
     completed = sum(1 for w in workouts if w.get('compliance_status') == 'completed')
 
     prev_week = (week_start - timedelta(days=7)).isoformat()
@@ -878,7 +1370,7 @@ def plan_page(request: Request, week: Optional[str] = None):
         deviation = compute_weekly_deviation(conn_inner, ref_date=week_start.isoformat())
         readiness = compute_readiness(conn_inner)
 
-    return templates.TemplateResponse("plan.html", {
+    return templates.TemplateResponse(request=request, name="plan.html", context={
         "request": request,
         "week_start": week_start.isoformat(),
         "week_end": week_end.isoformat(),
@@ -923,19 +1415,42 @@ def plan_page(request: Request, week: Optional[str] = None):
 
 @app.post("/api/workouts", dependencies=[Depends(verify_api_key)])
 async def api_upsert_workout(request: Request):
-    """Create or update a planned workout."""
+    """Create or update a canonical workout with optimistic locking."""
     data = await request.json()
-    with database.get_db() as conn:
-        database.upsert_planned_workout(conn, data)
-    return {"ok": True}
+    expected_revision = data.pop("expected_revision", None)
+    uid = str(data.pop("uid", "") or "")
+    if expected_revision is None:
+        raise HTTPException(409, "缺少 expected_revision，请刷新计划后重试")
+    try:
+        with database.get_db() as conn:
+            document = plan_store.load_plan()
+            if uid:
+                candidate = plan_store.apply_workout_changes(
+                    document, [{"uid": uid, "patch": data}]
+                )
+            else:
+                candidate = copy.deepcopy(document)
+                workout = {
+                    "uid": f"manual-{data.get('date', date.today().isoformat())}-{uuid.uuid4().hex[:8]}",
+                    **data,
+                }
+                candidate.setdefault("workouts", []).append(workout)
+            saved = plan_store.save_plan(
+                conn, candidate, expected_revision=int(expected_revision), source="web"
+            )
+        return {"ok": True, "revision": saved["revision"]}
+    except plan_store.PlanConflictError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except plan_store.CompletedWorkoutLockedError as exc:
+        raise HTTPException(423, str(exc)) from exc
+    except plan_store.PlanStoreError as exc:
+        raise HTTPException(422, str(exc)) from exc
 
 
 @app.delete("/api/workouts/{workout_id}", dependencies=[Depends(verify_api_key)])
 def api_delete_workout(workout_id: int):
-    """Delete a planned workout."""
-    with database.get_db() as conn:
-        database.delete_planned_workout(conn, workout_id)
-    return {"ok": True}
+    """Deletion is intentionally disabled until it can carry a revision token."""
+    raise HTTPException(405, "请在训练详情中将未来训练标记为休息，不直接删除")
 
 
 @app.get("/api/workouts", dependencies=[Depends(verify_api_key)])
@@ -947,6 +1462,54 @@ def api_list_workouts(
     with database.get_db() as conn:
         rows = database.list_planned_workouts(conn, date_from, date_to)
     return {"ok": True, "count": len(rows), "workouts": rows}
+
+
+@app.get("/api/plan-document", dependencies=[Depends(verify_api_key)])
+def api_plan_document():
+    try:
+        document = plan_store.load_plan()
+    except plan_store.PlanStoreError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    return {"ok": True, "plan": document}
+
+
+@app.post("/api/plan-proposals/{proposal_id}/apply", dependencies=[Depends(verify_api_key)])
+async def api_apply_plan_proposal(proposal_id: int, request: Request):
+    data = await request.json()
+    selected = data.get("selected", [])
+    if not isinstance(selected, list):
+        raise HTTPException(422, "selected 必须是变更序号数组")
+    try:
+        with database.get_db() as conn:
+            row = conn.execute(
+                "SELECT * FROM plan_change_proposals WHERE id=?", (proposal_id,)
+            ).fetchone()
+            if not row:
+                raise HTTPException(404, "找不到调整提案")
+            if row["status"] != "pending":
+                raise HTTPException(409, "调整提案已处理")
+            document = plan_store.load_plan()
+            if document["revision"] != row["base_revision"]:
+                raise plan_store.PlanConflictError("计划已更新，请重新生成 AI 调整提案")
+            changes = json.loads(row["changes_json"])
+            chosen = [changes[index] for index in selected if isinstance(index, int) and 0 <= index < len(changes)]
+            if not chosen:
+                raise HTTPException(422, "至少选择一项变更")
+            candidate = plan_store.apply_plan_changes(document, chosen)
+            saved = plan_store.save_plan(
+                conn, candidate, expected_revision=row["base_revision"], source="ai_proposal_confirmed"
+            )
+            conn.execute(
+                "UPDATE plan_change_proposals SET status='applied', applied_at=datetime('now') WHERE id=?",
+                (proposal_id,),
+            )
+        return {"ok": True, "revision": saved["revision"], "applied": len(chosen)}
+    except plan_store.PlanConflictError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except plan_store.CompletedWorkoutLockedError as exc:
+        raise HTTPException(423, str(exc)) from exc
+    except plan_store.PlanStoreError as exc:
+        raise HTTPException(422, str(exc)) from exc
 
 
 @app.post("/api/templates", dependencies=[Depends(verify_api_key)])
@@ -968,7 +1531,7 @@ def api_list_templates():
 
 @app.post("/api/generate-plan")
 async def api_generate_plan(request: Request):
-    """AI 生成训练计划。
+    """Generate a pending AI proposal; never overwrite the active plan.
 
     Body JSON:
       - profile: optional athlete profile overrides
@@ -979,15 +1542,60 @@ async def api_generate_plan(request: Request):
     week_offset = data.get("week_offset", 1)
 
     try:
-        from engine.plan_generator import generate_weekly_plan, save_plan
+        from engine.plan_generator import generate_weekly_plan
         with database.get_db() as conn:
-            workouts = generate_weekly_plan(conn, profile=profile, week_offset=week_offset)
-            count = save_plan(conn, workouts)
+            generated = generate_weekly_plan(conn, profile=profile, week_offset=week_offset)
+            document = plan_store.load_plan()
+            current_by_date_sport = {
+                (workout["date"], workout["sport"]): workout
+                for workout in document.get("workouts", [])
+                if workout.get("date") >= date.today().isoformat()
+            }
+            changes = []
+            comparable_fields = (
+                "title", "description", "target_distance_km", "target_duration_min",
+                "target_tss", "target_intensity", "target_pace_text", "target_hr_min",
+                "target_hr_max", "target_hr_text", "target_rpe", "target_rpe_min",
+                "target_rpe_max", "target_duration_source", "target_tss_source", "steps",
+                "coach_note", "safety_cutoff",
+            )
+            for suggestion in generated:
+                current = current_by_date_sport.get((suggestion.get("date"), suggestion.get("sport")))
+                if not current:
+                    continue
+                patch = {
+                    field: suggestion.get(field)
+                    for field in comparable_fields
+                    if field in suggestion and suggestion.get(field) != current.get(field)
+                }
+                if patch:
+                    changes.append({
+                        "uid": current["uid"],
+                        "patch": patch,
+                        "label": current.get("title") or current["date"],
+                        "date": current["date"],
+                        "before": {field: current.get(field) for field in patch},
+                        "after": patch,
+                    })
+            if not changes:
+                return {"ok": True, "proposal_id": None, "changes": [], "message": "AI 未提出需要修改的项目"}
+            cursor = conn.execute(
+                """INSERT INTO plan_change_proposals
+                   (base_revision, status, reason, changes_json)
+                   VALUES (?, 'pending', ?, ?)""",
+                (
+                    document["revision"],
+                    "用户主动请求 AI 调整",
+                    json.dumps(changes, ensure_ascii=False),
+                ),
+            )
+            proposal_id = int(cursor.lastrowid)
         return {
             "ok": True,
-            "count": count,
-            "workouts": workouts,
-            "message": f"已生成 {count} 个训练计划",
+            "proposal_id": proposal_id,
+            "base_revision": document["revision"],
+            "changes": changes,
+            "message": f"已生成 {len(changes)} 项待确认调整",
         }
     except ImportError as e:
         raise HTTPException(500, f"依赖缺失: {e}")
@@ -1015,7 +1623,9 @@ def generate_activity_review(conn, activity_id: int) -> dict:
         raise HTTPException(404, f"活动 {activity_id} 不存在")
 
     activity_date = activity.get("date", "")
-    sport = activity.get("sport", "cycling")
+    sport = activity.get("sport", "running")
+    if sport not in {"running", "training", "strength_training"}:
+        raise HTTPException(422, "当前 AI 复盘仅支持跑步和力量训练")
 
     # 获取当日健康/体能数据
     wellness = database.get_wellness(conn, activity_date) if activity_date else None
@@ -1031,12 +1641,11 @@ def generate_activity_review(conn, activity_id: int) -> dict:
     planned_workouts = [dict(p) for p in planned] if planned else []
 
     # 解析 JSON 字段
-    power_zones = json.loads(activity["power_zones_json"]) if activity.get("power_zones_json") else None
     hr_zones = json.loads(activity["hr_zones_json"]) if activity.get("hr_zones_json") else None
     laps = json.loads(activity["laps_json"]) if activity.get("laps_json") else None
 
     # 构建活动摘要（给 LLM 的上下文）
-    sport_names = {"cycling": "骑行", "running": "跑步", "training": "力量训练"}
+    sport_names = {"running": "跑步", "training": "力量训练", "strength_training": "力量训练"}
     sport_cn = sport_names.get(sport, sport)
 
     activity_summary = f"""活动名称: {activity.get('name', '未知')}
@@ -1047,17 +1656,10 @@ def generate_activity_review(conn, activity_id: int) -> dict:
 运动时间: {round(activity['total_timer_s'] / 60) if activity.get('total_timer_s') else '无'}分钟
 平均心率: {activity.get('avg_hr') or '无'}bpm
 最大心率: {activity.get('max_hr') or '无'}bpm
-平均功率: {activity.get('avg_power') or '无'}W
-最大功率: {activity.get('max_power') or '无'}W
-标准化功率(NP): {round(activity['normalized_power']) if activity.get('normalized_power') else '无'}W
 TSS: {round(activity['tss']) if activity.get('tss') else '无'}
-IF: {round(activity['intensity_factor'], 2) if activity.get('intensity_factor') else '无'}
-xPower: {round(activity['xpower']) if activity.get('xpower') else '无'}W
-FTP(设备): {activity.get('device_ftp') or '无'}W
-eFTP(估算): {round(activity['estimated_ftp']) if activity.get('estimated_ftp') else '无'}W
 爬升: {round(activity['total_ascent']) if activity.get('total_ascent') else '无'}m
-平均踏频: {activity.get('avg_cadence') or '无'}rpm
-平均速度: {round(activity['avg_speed'] * 3.6, 1) if activity.get('avg_speed') else '无'}km/h
+平均步频: {activity.get('avg_cadence') or '无'}spm
+平均配速: {round((1000 / activity['avg_speed']) / 60, 2) if activity.get('avg_speed') else '无'}min/km
 有氧训练效果: {activity.get('aerobic_te') or '无'}
 无氧训练效果: {activity.get('anaerobic_te') or '无'}
 心率漂移: {f"{round(activity['drift_pct'], 1)}% ({activity.get('drift_classification', '')})" if activity.get('drift_pct') is not None else '无'}
@@ -1091,23 +1693,26 @@ TRIMP: {round(activity['trimp']) if activity.get('trimp') else '无'}
     if planned_workouts:
         plan_items = []
         for pw in planned_workouts:
+            rpe_min = pw.get("target_rpe_min") if pw.get("target_rpe_min") is not None else pw.get("target_rpe")
+            rpe_max = pw.get("target_rpe_max") if pw.get("target_rpe_max") is not None else pw.get("target_rpe")
             plan_items.append(
                 f"  - {pw.get('title', '未命名')}: {pw.get('sport', '')}, "
                 f"目标时长 {pw.get('target_duration_min') or '无'}分钟, "
                 f"目标TSS {pw.get('target_tss') or '无'}, "
-                f"强度 {pw.get('target_intensity') or '无'}"
+                f"配速 {pw.get('target_pace_text') or pw.get('target_intensity') or '无'}, "
+                f"心率 {pw.get('target_hr_text') or '无'}, "
+                f"RPE {rpe_min if rpe_min is not None else '无'}-{rpe_max if rpe_max is not None else '无'}, "
+                f"安全截断 {pw.get('safety_cutoff') or '无'}"
             )
         plan_context = f"\n当日计划训练:\n" + "\n".join(plan_items)
 
-    # 功率区间
     zones_context = ""
-    if power_zones:
-        zone_names = {"z1": "Z1恢复", "z2": "Z2耐力", "z3": "Z3节奏", "z4": "Z4阈值", "z5": "Z5 VO2max", "z6": "Z6无氧", "z7": "Z7神经"}
-        zone_lines = [f"  {zone_names.get(z['zone'], z['zone'])}: {z.get('pct', 0):.0f}%（{z.get('seconds', 0):.0f}秒）" for z in power_zones]
-        zones_context = "\n功率区间分布:\n" + "\n".join(zone_lines)
+    if hr_zones:
+        zone_lines = [f"  {z.get('zone', '')}: {z.get('pct', 0):.0f}%" for z in hr_zones]
+        zones_context = "\n心率区间分布:\n" + "\n".join(zone_lines)
 
     # LLM 提示词
-    system_prompt = """你是一位专业的自行车运动训练分析师，负责对骑行活动进行结构化复盘分析。
+    system_prompt = """你是一位专业马拉松跑步教练，精通 Tinman CV、Canova 专项耐力和 Mantz 带疲劳目标配速训练。
 
 你的分析必须基于数据，客观、简洁、具有训练指导价值。
 
@@ -1117,8 +1722,8 @@ TRIMP: {round(activity['trimp']) if activity.get('trimp') else '无'}
 
 {
   "summary": {
-    "overall_label": "一个2-4字的评价标签，如'高质量耐力骑'、'恢复骑行'、'过度疲劳'等",
-    "one_line_summary": "一句话总结本次骑行的核心特征和训练价值",
+    "overall_label": "一个2-6字的跑步评价标签",
+    "one_line_summary": "一句话总结本次跑步的核心特征和训练价值",
     "completion_status": "完成度评价：完美执行/基本完成/部分完成/未完成",
     "fatigue_impact": "对疲劳的影响评价：低/中/高/极高",
     "plan_impact": "对后续训练计划的影响：无影响/轻微调整/需要调整/需要重新规划"
@@ -1129,10 +1734,10 @@ TRIMP: {round(activity['trimp']) if activity.get('trimp') else '无'}
     "第三个关键发现"
   ],
   "narrative": {
-    "training_type": "识别本次训练的类型和目的（耐力骑、间歇训练、恢复骑等），并说明判断依据",
-    "execution_quality": "评估训练执行质量：功率稳定性、心率控制、节奏把控等",
+    "training_type": "识别本次是恢复跑、轻松跑、CV/间歇、M-Pace、长距离或比赛，并说明依据",
+    "execution_quality": "逐组或分段评估配速、心率、恢复和对应步频，不用全活动平均步频代替分段判断",
     "physiological_cost": "分析生理成本：TSS负荷、心率漂移、碳水消耗、恢复需求",
-    "capacity_signal": "分析能力信号：eFTP变化、功率区间表现、是否有突破迹象",
+    "capacity_signal": "分析 CV、M-Pace、长距离后段和心率漂移所反映的能力信号",
     "abnormal_and_noise": "指出异常数据或干扰因素（如天气、设备问题、路况等）",
     "next_steps": "基于本次训练结果，对后续1-2天训练的具体建议"
   },
@@ -1142,7 +1747,7 @@ TRIMP: {round(activity['trimp']) if activity.get('trimp') else '无'}
   }
 }"""
 
-    user_prompt = f"""请对以下骑行活动进行结构化复盘分析：
+    user_prompt = f"""请对以下跑步活动进行结构化复盘分析：
 
 {activity_summary}
 {fitness_context}
@@ -1166,7 +1771,7 @@ TRIMP: {round(activity['trimp']) if activity.get('trimp') else '无'}
     review_data = llm_client.extract_json(response_text)
 
     # 补充元数据
-    review_data["analysis_version"] = "ride_review_v1"
+    review_data["analysis_version"] = "running_review_v1"
     review_data["generated_at"] = datetime.now().isoformat()
     review_data["review_status"] = "completed"
     review_data["sport_type"] = sport
@@ -1253,7 +1858,7 @@ def body_data_page(request: Request):
         body_comparisons = get_body_comp_comparisons(conn)
         metric_cards = get_metric_comparisons(conn)
 
-    return templates.TemplateResponse("body_data.html", {
+    return templates.TemplateResponse(request=request, name="body_data.html", context={
         "request": request,
         "latest": latest,
         "previous": previous,
@@ -1292,11 +1897,11 @@ def settings_page(request: Request):
     """Settings page — API config + athlete profile."""
     setting_keys = [
         "llm_api_key", "llm_api_base", "llm_proxy", "llm_model", "llm_vision_model",
-        "athlete_ftp", "athlete_max_hr", "athlete_resting_hr",
+        "athlete_max_hr", "athlete_resting_hr",
         "athlete_goal", "athlete_focus", "athlete_weekly_hours_available",
         "athlete_event_name", "athlete_event_date",
         "athlete_constraints", "athlete_constraints_text",
-        "garmin_token_path",
+        "garmin_token_path", "navigation_order",
     ]
     settings = {}
     with database.get_db() as conn:
@@ -1309,9 +1914,15 @@ def settings_page(request: Request):
                     settings["llm_api_key_set"] = True
                 else:
                     settings[key] = val
-    return templates.TemplateResponse("settings.html", {
+                    
+    # Check if Intervals API key is configured
+    from engine import intervals
+    has_intervals_env = intervals.is_configured()
+    
+    return templates.TemplateResponse(request=request, name="settings.html", context={
         "request": request,
         "settings": settings,
+        "has_intervals_env": has_intervals_env,
     })
 
 
@@ -1319,6 +1930,14 @@ def settings_page(request: Request):
 async def api_save_settings(request: Request):
     """Save settings to database."""
     data = await request.json()
+    if "navigation_order" in data:
+        try:
+            ordered_items = _ordered_navigation_items(data["navigation_order"], strict=True)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        data["navigation_order"] = json.dumps(
+            [item["key"] for item in ordered_items], ensure_ascii=False
+        )
     with database.get_db() as conn:
         for key, value in data.items():
             if value is not None and str(value).strip():
@@ -1363,7 +1982,7 @@ async def api_sync_garmin(request: Request):
             if result["errors"]:
                 msg += f" (错误: {len(result['errors'])})"
             return {"ok": True, "message": msg, "detail": result}
-        else:
+        elif sync_type == "activities":
             results = garmin_sync.sync_recent(days=7)
             # Auto-match to planned workouts
             with database.get_db() as conn:
@@ -1373,8 +1992,77 @@ async def api_sync_garmin(request: Request):
                 "message": f"已同步 {len(results)} 个活动" + (f"，匹配 {matched} 个计划" if matched else ""),
                 "count": len(results),
             }
+        elif sync_type == "all":
+            # 先同步活动
+            act_results = garmin_sync.sync_recent(days=7)
+            with database.get_db() as conn:
+                matched = database.match_compliance(conn)
+            
+            # 再同步健康数据
+            well_result = garmin_sync.sync_garmin_wellness(days=14)
+            
+            msg = (
+                f"同步全部完成。活动: {len(act_results)}个" + (f"(匹配{matched})" if matched else "") +
+                f"，健康: {well_result['days_synced']}天。"
+            )
+            return {
+                "ok": True, 
+                "message": msg,
+                "detail": {
+                    "activities": len(act_results),
+                    "wellness": well_result
+                }
+            }
+        else:
+             raise HTTPException(400, "未知的同步类型")
     except Exception as e:
         raise HTTPException(500, f"Garmin 同步失败: {e}")
+
+
+@app.post("/api/sync-intervals")
+async def api_sync_intervals(request: Request):
+    """Sync data from Intervals.icu."""
+    data = await request.json()
+    sync_type = data.get("type", "activities")
+
+    try:
+        from engine import intervals
+        if not intervals.is_configured():
+            return {"ok": False, "detail": "未配置 Intervals.icu API Key，请在 .env 文件中设置 INTERVALS_API_KEY"}
+
+        if sync_type == "wellness":
+            # 1. Sync wellness (last 14 days)
+            end_date = date.today()
+            start_date = end_date - timedelta(days=14)
+            wellness_data = intervals.fetch_wellness_range(start_date.isoformat(), end_date.isoformat())
+
+            synced_wellness = 0
+            with database.get_db() as conn:
+                for w in wellness_data:
+                    database.upsert_wellness(conn, w)
+                    synced_wellness += 1
+
+            # 2. Sync today's fitness to settings (CTL, ATL)
+            seed_result = intervals.auto_seed()
+
+            msg = f"已同步 {synced_wellness} 天健康数据。"
+            if seed_result.get("ctl"):
+                msg += f" 当前 CTL: {seed_result['ctl']}."
+            return {"ok": True, "message": msg}
+
+        else:
+            # Sync activities and validate
+            val_result = intervals.auto_validate(days=14)
+            validated = val_result.get('validated', 0)
+            passed = val_result.get('passed', 0)
+            
+            # 检查是否有重复或者异常的细节可以在 detail 中展示
+            msg = f"已与 Intervals.icu 校验最近14天活动。共比对 {validated} 个活动，完全一致 {passed} 个。"
+            return {"ok": True, "message": msg, "detail": val_result}
+
+    except Exception as e:
+        logger.exception("Intervals.icu 同步失败")
+        raise HTTPException(500, f"Intervals 同步失败: {e}")
 
 
 @app.post("/api/inbody-ocr")

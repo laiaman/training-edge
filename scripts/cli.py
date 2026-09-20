@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import date
 from pathlib import Path
@@ -12,7 +13,7 @@ from pathlib import Path
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from engine import database, sync, validator, intervals
+from engine import database, sync, validator, intervals, garmin_db_adapter
 
 
 def cmd_init(args):
@@ -94,6 +95,91 @@ def cmd_sync(args):
         print(json.dumps(results, ensure_ascii=False, indent=2, default=str))
 
 
+def cmd_sync_wellness(args):
+    """Sync wellness data (HRV, sleep, body battery, etc.)."""
+    database.init_db()
+    print(f"Syncing wellness last {args.days} days...")
+    try:
+        result = sync.sync_garmin_wellness(days=args.days)
+    except Exception as e:
+        print(f"  ✗ Wellness sync failed: {e}")
+        print("  Tips:")
+        print("    - If you have a local garmin.db (Hermes-maintained), set GARMIN_DB_PATH to read without API calls.")
+        print("      Example: GARMIN_DB_PATH=../garmin.db python scripts/cli.py sync-wellness --days 14")
+        print("    - Otherwise set GARMIN_EMAIL/GARMIN_PASSWORD or provide valid tokens via GARMINTOKENS.")
+        raise SystemExit(1)
+
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+        return
+
+    source = result.get("source", "garmin")
+    days_synced = result.get("days_synced")
+    hrv_count = result.get("hrv_count")
+    sleep_count = result.get("sleep_count")
+    errors = result.get("errors") or []
+
+    print(f"  Source: {source}")
+    if days_synced is not None:
+        print(f"  Days synced: {days_synced}")
+    if hrv_count is not None:
+        print(f"  HRV records: {hrv_count}")
+    if sleep_count is not None:
+        print(f"  Sleep records: {sleep_count}")
+    if errors:
+        print(f"  Errors: {len(errors)}")
+
+
+def cmd_sync_hermes(args):
+    """Sync all available Hermes garmin.db data into TrainingEdge (no Garmin API calls)."""
+    database.init_db()
+
+    db_path = args.db or os.environ.get("GARMIN_DB_PATH") or "../garmin.db"
+    p = Path(db_path).expanduser()
+    if not p.is_absolute():
+        p = (Path(__file__).resolve().parents[1] / p).resolve()
+    else:
+        p = p.resolve()
+
+    days = 0 if args.all else args.days
+    days_label = "ALL" if days <= 0 else str(days)
+    print(f"Syncing Hermes garmin.db → TrainingEdge (db={p}, days={days_label})...")
+
+    wellness_days = garmin_db_adapter.sync_from_garmin_db(p, days=days)
+    fitness_days = garmin_db_adapter.sync_fitness_from_garmin_db(p, days=days)
+    activities = garmin_db_adapter.sync_activities_from_garmin_db(
+        p,
+        days=days,
+        include_splits=not args.no_splits,
+        include_hr_zones=not args.no_hr_zones,
+        include_notes=not args.no_notes,
+        store_raw=not args.no_raw,
+    )
+
+    result = {
+        "db": str(p),
+        "days": days_label,
+        "wellness_days_synced": wellness_days,
+        "fitness_days_synced": fitness_days,
+        "activities": activities,
+    }
+
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+        return
+
+    print("\nDone.")
+    print(f"  Wellness days synced: {wellness_days}")
+    print(f"  Fitness days synced:  {fitness_days}")
+    print(f"  Activities imported:  {activities.get('imported', 0)} (updated {activities.get('updated', 0)})")
+    if activities.get("splits_imported"):
+        print(f"  With splits/laps:     {activities.get('splits_imported')}")
+    if activities.get("hr_zones_imported"):
+        print(f"  With HR zones:        {activities.get('hr_zones_imported')}")
+    if activities.get("notes_imported"):
+        print(f"  With notes:           {activities.get('notes_imported')}")
+
+
 def cmd_activities(args):
     """List activities from local database."""
     database.init_db()
@@ -157,7 +243,27 @@ def cmd_serve(args):
     import uvicorn
     database.init_db()
     print(f"Starting TrainingEdge on http://0.0.0.0:{args.port}")
-    uvicorn.run("api.app:app", host="0.0.0.0", port=args.port, reload=args.reload)
+
+    reload_kwargs = {}
+    if args.reload:
+        project_root = str(Path(__file__).resolve().parents[1])
+        reload_kwargs = {
+            "reload": True,
+            "reload_dirs": [
+                str(Path(project_root) / "api"),
+                str(Path(project_root) / "engine"),
+                str(Path(project_root) / "web"),
+            ],
+            "reload_includes": ["*.py", "*.html"],
+            "reload_excludes": [".*", "__pycache__", "*.pyc", "state/*", "scripts/*"],
+        }
+
+    uvicorn.run(
+        "api.app:app",
+        host="0.0.0.0",
+        port=args.port,
+        **reload_kwargs,
+    )
 
 
 def main():
@@ -177,6 +283,24 @@ def main():
     p_sync.add_argument("--ftp", type=float)
     p_sync.add_argument("--json", action="store_true")
     p_sync.set_defaults(func=cmd_sync)
+
+    # sync-wellness
+    p_sw = sub.add_parser("sync-wellness", help="Sync wellness (HRV/sleep/body battery) from garmin.db or Garmin API")
+    p_sw.add_argument("--days", type=int, default=14)
+    p_sw.add_argument("--json", action="store_true")
+    p_sw.set_defaults(func=cmd_sync_wellness)
+
+    # sync-hermes (full import from Hermes garmin.db)
+    p_sh = sub.add_parser("sync-hermes", help="Sync ALL Hermes garmin.db data into TrainingEdge (no Garmin API calls)")
+    p_sh.add_argument("--db", help="Path to Hermes garmin.db (default: $GARMIN_DB_PATH or ../garmin.db)")
+    p_sh.add_argument("--days", type=int, default=3650, help="How many days to import (ignored when --all)")
+    p_sh.add_argument("--all", action="store_true", help="Import full history (MIN(date) → today)")
+    p_sh.add_argument("--no-splits", action="store_true", help="Skip importing activity splits/laps")
+    p_sh.add_argument("--no-hr-zones", action="store_true", help="Skip importing HR zone distribution")
+    p_sh.add_argument("--no-notes", action="store_true", help="Skip importing activity subjective notes")
+    p_sh.add_argument("--no-raw", action="store_true", help="Do not store Hermes raw JSON blobs into hermes_* tables")
+    p_sh.add_argument("--json", action="store_true")
+    p_sh.set_defaults(func=cmd_sync_hermes)
 
     # activities
     p_act = sub.add_parser("activities", help="List activities from local DB")

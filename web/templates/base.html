@@ -261,6 +261,16 @@
             .page-header h1 { font-size: 28px; }
             .metric-value { font-size: 34px; }
             nav { padding: 0 16px; gap: 20px; }
+            .metric-grid { grid-template-columns: repeat(2, 1fr) !important; }
+            .chart-wrap, .chart-wrap-lg { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+            .chart-wrap canvas, .chart-wrap-lg canvas { min-width: 600px; }
+            nav { overflow-x: auto; white-space: nowrap; -webkit-overflow-scrolling: touch; }
+        }
+        @media (max-width: 420px) {
+            .metric-grid { grid-template-columns: repeat(2, 1fr) !important; gap: 8px !important; }
+            .metric-card { padding: 12px 14px !important; }
+            .page-header { padding: 28px 0 8px; }
+            .page-header h1 { font-size: 24px; }
         }
 
         /* ── Scrollbar ── */
@@ -286,10 +296,7 @@
 <body>
     <nav>
         <a href="/" class="logo"><span>Training</span>Edge</a>
-        <a href="/">面板</a>
-        <a href="/body-data">身体数据</a>
-        <a href="/plan">训练计划</a>
-        <a href="/settings">设置</a>
+        {% for item in navigation_items %}<a href="{{ item.href }}">{{ item.label }}</a>{% endfor %}
     </nav>
     <div class="container">
         {% block content %}{% endblock %}

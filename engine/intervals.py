@@ -23,15 +23,25 @@ def _find_api_key() -> Optional[str]:
     if env_key:
         return env_key
 
-    # 2. Existing skill's key file
-    key_file = (
-        Path(__file__).resolve().parents[3]
-        / "skills" / "garmin-cycling-coach" / "state" / "intervals_api_key"
-    )
-    if key_file.exists():
-        key = key_file.read_text(encoding="utf-8").strip()
-        if key:
-            return key
+    # 2. Local .env file
+    env_path = Path(__file__).resolve().parents[1] / ".env"
+    if env_path.exists():
+        with open(env_path) as f:
+            for line in f:
+                if line.startswith("INTERVALS_API_KEY="):
+                    return line.split("=")[1].strip().strip('"\'')
+
+    # 3. Check db config (if db is initialized)
+    try:
+        from engine.database import get_db
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("SELECT setting_value FROM app_settings WHERE setting_key = 'intervals_api_key'")
+            row = c.fetchone()
+            if row and row[0]:
+                return row[0]
+    except Exception:
+        pass
 
     return None
 

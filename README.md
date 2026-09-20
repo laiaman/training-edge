@@ -75,7 +75,32 @@ docker compose up -d
 
 Open `http://localhost:8420`
 
-### Local Development
+### Local Development (macOS)
+
+Run the service from a local project checkout. OneDrive is backup-only:
+
+- Code source: `<local-checkout>/training-edge`
+- Runtime dir: `~/Library/Application Support/TrainingEdge/` (DB, venv, tokens, logs)
+- OneDrive: only the three allowlisted plan files described below
+- Configure paths in `.env` (auto-loaded on import)
+
+```bash
+bash scripts/install_service.sh --preflight
+bash scripts/install_service.sh    # launchd: auto-start + crash recovery
+bash scripts/verify_local_runtime.sh
+bash scripts/backup_plan_to_onedrive.sh --dry-run
+bash scripts/backup_plan_to_onedrive.sh
+bash scripts/start_server.sh --status
+python scripts/smoke_test.py
+```
+
+`install_service.sh` rejects a checkout under `CloudStorage/OneDrive`, even if
+that older copy still exists. On a bootstrap failure it starts the same local
+checkout as a temporary non-reload service and reports the launchd failure.
+
+See [README.zh-CN.md](README.zh-CN.md) for full macOS setup guide.
+
+### Local Development (generic)
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
@@ -84,6 +109,28 @@ python scripts/cli.py init
 python scripts/cli.py sync --days 7
 python scripts/cli.py serve --reload --port 8420
 ```
+
+### Reuse Hermes `garmin.db` (full import)
+
+If you already have a Hermes-maintained `garmin.db` (e.g. `../garmin.db` in the parent project), you can import your full history into TrainingEdge without calling Garmin API:
+
+```bash
+python scripts/cli.py sync-hermes --db ../garmin.db --all
+```
+
+> Note: this import writes into TrainingEdge `activities` / `wellness` / `fitness_history` and stores Hermes raw JSON into `hermes_*` tables. It **does not download FIT files**, so power-derived metrics (NP/TSS/IF, PDC, etc.) will be empty until you run `python scripts/cli.py sync --days N`.
+
+### How do I access it after startup?
+
+- **Web dashboard**: `http://localhost:8420/`
+- **Health check**: `http://localhost:8420/api/health` (no auth)
+- **API calls**: run `python scripts/cli.py init` to get an **API Key**, then send `X-API-Key` (example):
+
+```bash
+curl -H 'X-API-Key: <API_KEY>' http://localhost:8420/api/summary
+```
+
+> If `TRAININGEDGE_PASSWORD` is set, browser access will redirect to `/login`. API calls still require `X-API-Key`.
 
 ### Configuration
 
@@ -185,6 +232,81 @@ training-edge/
 ├── Dockerfile
 ├── docker-compose.yml
 └── .env.example
+```
+
+---
+
+## Migration & Backup
+
+Full AICoachPortable migration (vault, garmin.db, Hermes): see [../README.md#项目迁移指南](../README.md#项目迁移指南).
+
+**Rule: local code runs, local state stays local, OneDrive receives only plan backups.**
+Never run this service from OneDrive and never put SQLite DB / tokens / FIT / logs / venv there.
+
+| Asset | Location | Migrate how |
+|-------|----------|-------------|
+| Code | local `AICoachPortableOnMac/training-edge/` | Git checkout/update |
+| Config | `.env` | Manual copy (secrets) |
+| Runtime DB | `~/Library/Application Support/TrainingEdge/` | Manual tar backup |
+| venv | same dir `venv/` | **Rebuild** on new machine |
+| Plan backup | OneDrive `AICoachPortable/vault/` | `scripts/backup_plan_to_onedrive.sh` |
+
+**New Mac (quick):**
+
+```bash
+# Old machine: stop service, backup runtime (exclude venv) + .env
+RUNTIME="$HOME/Library/Application Support/TrainingEdge"
+tar czf ~/Desktop/te-runtime.tar.gz -C "$RUNTIME" --exclude='venv' .
+cp .env ~/Desktop/trainingedge.env.backup
+
+# New machine: restore, rebuild venv, reinstall service
+mkdir -p "$RUNTIME" && tar xzf ~/Desktop/te-runtime.tar.gz -C "$RUNTIME"
+cp ~/Desktop/trainingedge.env.backup training-edge/.env
+python3 -m venv "$RUNTIME/venv" && "$RUNTIME/venv/bin/pip" install -e training-edge/
+cd training-edge && bash scripts/install_service.sh && python scripts/smoke_test.py
+```
+
+See [README.zh-CN.md — 迁移与备份](README.zh-CN.md#迁移与备份) for Docker/NAS and dual-machine scenarios.
+
+---
+
+## Troubleshooting
+
+### 503 Service Unavailable / Can't Connect
+
+The server process is not running. Common causes: macOS sleep/lid close killing the process, or OneDrive sync triggering excessive reloads.
+
+```bash
+bash scripts/start_server.sh --status   # Check
+bash scripts/start_server.sh            # Start/restart
+bash scripts/start_server.sh --stop     # Stop first if port conflict
+```
+
+### 500 Internal Server Error
+
+Usually caused by a template referencing a variable not passed from the route. Run the smoke test to diagnose:
+
+```bash
+python scripts/smoke_test.py --offline  # Syntax + engine + render check
+```
+
+### OneDrive checkout is rejected
+
+The production installer intentionally rejects any project path under
+`CloudStorage/OneDrive`. Move/open the local checkout, then install from there:
+
+```bash
+cd <local-checkout>/training-edge
+bash scripts/install_service.sh
+```
+
+### Smoke Test
+
+Run after every code change to catch regressions:
+
+```bash
+python scripts/smoke_test.py --offline  # No server needed
+python scripts/smoke_test.py            # Full test (server must be running)
 ```
 
 ---

@@ -123,6 +123,15 @@
         color: var(--blue);
         border-color: rgba(10,132,255,0.3);
     }
+    .nav-order-list { display:flex; flex-direction:column; gap:8px; }
+    .nav-order-item { display:grid; grid-template-columns:28px minmax(0,1fr) auto; gap:10px; align-items:center; padding:10px 12px; border:.5px solid var(--glass-border); border-radius:10px; background:rgba(255,255,255,.035); }
+    .nav-order-index { width:24px; height:24px; display:flex; align-items:center; justify-content:center; border-radius:50%; background:rgba(10,132,255,.14); color:var(--blue); font-size:12px; font-weight:700; }
+    .nav-order-name { font-size:14px; font-weight:600; }
+    .nav-order-description { font-size:12px; color:var(--text-tertiary); margin-top:2px; }
+    .nav-order-actions { display:flex; gap:6px; }
+    .nav-move { width:32px; height:30px; border:.5px solid var(--glass-border); border-radius:8px; background:var(--bg-secondary); color:var(--text-secondary); cursor:pointer; }
+    .nav-move:hover:not(:disabled) { color:var(--text-primary); border-color:var(--blue); }
+    .nav-move:disabled { opacity:.25; cursor:not-allowed; }
 
     @media (max-width: 768px) {
         .settings-grid { grid-template-columns: 1fr; }
@@ -198,35 +207,26 @@
         <div class="settings-section">
             <h3>运动员档案</h3>
 
-            <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:12px;">
-                <div class="form-group">
-                    <label>FTP (W)</label>
-                    <input type="number" id="athlete_ftp" value="{{ settings.athlete_ftp or '229' }}" placeholder="229">
-                </div>
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
                 <div class="form-group">
                     <label>最大心率 (bpm)</label>
-                    <input type="number" id="athlete_max_hr" value="{{ settings.athlete_max_hr or '192' }}" placeholder="192">
+                    <input type="number" id="athlete_max_hr" value="{{ settings.athlete_max_hr or '175' }}" placeholder="175">
                 </div>
                 <div class="form-group">
                     <label>静息心率 (bpm)</label>
-                    <input type="number" id="athlete_resting_hr" value="{{ settings.athlete_resting_hr or '42' }}" placeholder="42">
+                    <input type="number" id="athlete_resting_hr" value="{{ settings.athlete_resting_hr or '41' }}" placeholder="41">
                 </div>
             </div>
 
             <div class="form-group">
                 <label>训练目标</label>
-                <textarea id="athlete_goal" rows="2" placeholder="例：提升骑行FTP至260W，备战铁三...">{{ settings.athlete_goal or '提升骑行能力，维持跑步基础，增强核心力量' }}</textarea>
+                <textarea id="athlete_goal" rows="2" placeholder="例：北京马拉松 2:55">{{ settings.athlete_goal or '2026北京马拉松 2:55，南昌马拉松备选峰值' }}</textarea>
             </div>
 
             <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
                 <div class="form-group">
                     <label>主项</label>
-                    <select id="athlete_focus">
-                        <option value="cycling" {% if (settings.athlete_focus or 'cycling') == 'cycling' %}selected{% endif %}>骑行</option>
-                        <option value="running" {% if settings.athlete_focus == 'running' %}selected{% endif %}>跑步</option>
-                        <option value="triathlon" {% if settings.athlete_focus == 'triathlon' %}selected{% endif %}>铁三</option>
-                        <option value="strength" {% if settings.athlete_focus == 'strength' %}selected{% endif %}>力量</option>
-                    </select>
+                    <select id="athlete_focus"><option value="running" selected>跑步（力量为独立辅助主项）</option></select>
                 </div>
                 <div class="form-group">
                     <label>每周可用时间 (小时)</label>
@@ -237,7 +237,7 @@
             <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
                 <div class="form-group">
                     <label>目标赛事名称</label>
-                    <input type="text" id="athlete_event_name" value="{{ settings.athlete_event_name or '' }}" placeholder="例：IRONMAN 70.3">
+                    <input type="text" id="athlete_event_name" value="{{ settings.athlete_event_name or '2026北京马拉松' }}" placeholder="例：2026北京马拉松">
                 </div>
                 <div class="form-group">
                     <label>赛事日期</label>
@@ -247,11 +247,32 @@
 
             <div class="form-group">
                 <label>约束条件（每行一条）</label>
-                <textarea id="athlete_constraints" rows="3" placeholder="每周至少1次跑步&#10;每周2-3次力量训练&#10;骑行为主要训练项目">{{ settings.athlete_constraints_text or '每周至少1次跑步\n每周2-3次力量训练\n骑行为主要训练项目' }}</textarea>
+                <textarea id="athlete_constraints" rows="3" placeholder="周三田径场质量课&#10;周日长距离&#10;保护跟腱与腰骶部">{{ settings.athlete_constraints_text or '周三晚固定田径场质量课\n周日长距离\n保护腰骶部、跟腱和比目鱼肌' }}</textarea>
             </div>
 
             <button class="btn-primary" onclick="saveAthleteSettings()">保存档案</button>
         </div>
+    </div>
+</div>
+
+<!-- ── 顶部导航排序 ── -->
+<div class="card section">
+    <div class="settings-section">
+        <h3>顶部导航 Tab 排序</h3>
+        <div class="hint" style="font-size:12px;color:var(--text-tertiary);margin-bottom:12px;">用上下按钮调整顺序。仅改变展示位置，不隐藏页面或修改地址。</div>
+        <div id="navigationOrderList" class="nav-order-list">
+            {% for item in navigation_items %}
+            <div class="nav-order-item" data-key="{{ item.key }}">
+                <span class="nav-order-index">{{ loop.index }}</span>
+                <div><div class="nav-order-name">{{ item.label }}</div><div class="nav-order-description">{{ item.description }}</div></div>
+                <div class="nav-order-actions">
+                    <button class="nav-move move-up" type="button" onclick="moveNavigationItem(this, -1)" aria-label="上移 {{ item.label }}">↑</button>
+                    <button class="nav-move move-down" type="button" onclick="moveNavigationItem(this, 1)" aria-label="下移 {{ item.label }}">↓</button>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+        <button class="btn-primary" style="margin-top:14px;" onclick="saveNavigationOrder()">保存 Tab 顺序</button>
     </div>
 </div>
 
@@ -266,9 +287,10 @@
                     <input type="text" id="garmin_token_path" value="{{ settings.garmin_token_path or '' }}" placeholder="/path/to/garmin/tokens">
                     <div class="hint">已通过 garminconnect 库登录后的 token 目录</div>
                 </div>
-                <div style="display:flex; gap:10px;">
-                    <button class="btn-primary" style="background:var(--green);" onclick="syncGarmin('activities')">同步活动</button>
-                    <button class="btn-primary" style="background:var(--teal);" onclick="syncGarmin('wellness')">同步健康数据</button>
+                <div style="display:flex; flex-wrap: wrap; gap:10px;">
+                    <button class="btn-primary" style="background:var(--blue);" onclick="syncGarmin('all')">同步全部数据</button>
+                    <button class="btn-primary" style="background:var(--green);" onclick="syncGarmin('activities')">仅同步活动</button>
+                    <button class="btn-primary" style="background:var(--teal);" onclick="syncGarmin('wellness')">仅同步健康</button>
                 </div>
                 <div id="garminSyncResult" class="api-test-result"></div>
             </div>
@@ -278,6 +300,34 @@
                     <p><strong>同步活动</strong>：下载最近7天的 FIT 文件并解析</p>
                     <p><strong>同步健康数据</strong>：获取 HRV、睡眠、静息心率、Body Battery 等</p>
                     <p style="margin-top:8px; color:var(--text-tertiary);">需要先通过 garminconnect 登录并保存 token</p>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ── Intervals.icu 同步 ── -->
+<div class="card section" style="margin-top:16px;">
+    <div class="settings-section">
+        <h3>Intervals.icu 同步</h3>
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:20px;">
+            <div>
+                <div class="form-group">
+                    <label>API Key (从 .env 文件加载)</label>
+                    <input type="text" disabled value="{% if has_intervals_env %}已配置 (***){% else %}未配置，请在 .env 中添加 INTERVALS_API_KEY{% endif %}" class="form-input" style="opacity: 0.7;">
+                </div>
+                <div style="display:flex; gap:10px;">
+                    <button class="btn-primary" style="background:var(--orange);" onclick="syncIntervals('activities')">同步活动(校验)</button>
+                    <button class="btn-primary" style="background:var(--blue);" onclick="syncIntervals('wellness')">同步健康数据</button>
+                </div>
+                <div id="intervalsSyncResult" class="api-test-result"></div>
+            </div>
+            <div>
+                <div class="card-label">同步说明</div>
+                <div style="font-size:13px; color:var(--text-secondary); line-height:1.8;">
+                    <p><strong>同步活动（校验）</strong>：从 Intervals.icu 拉取最新活动，与本地跑步记录比对重复、时长、距离及 TSS。</p>
+                    <p><strong>同步健康数据</strong>：获取 CTL/ATL、睡眠和 HRV 等恢复趋势。</p>
+                    <p style="margin-top:8px; color:var(--text-tertiary);">请在项目的 <code>.env</code> 文件中配置 <code>INTERVALS_API_KEY</code> 环境变量。</p>
                 </div>
             </div>
         </div>
@@ -301,6 +351,41 @@ function showToast(msg, type='success') {
     setTimeout(() => t.classList.remove('show'), 3000);
 }
 
+function refreshNavigationControls() {
+    const items = [...document.querySelectorAll('#navigationOrderList .nav-order-item')];
+    items.forEach((item, index) => {
+        item.querySelector('.nav-order-index').textContent = index + 1;
+        item.querySelector('.move-up').disabled = index === 0;
+        item.querySelector('.move-down').disabled = index === items.length - 1;
+    });
+}
+
+function moveNavigationItem(button, direction) {
+    const item = button.closest('.nav-order-item');
+    const sibling = direction < 0 ? item.previousElementSibling : item.nextElementSibling;
+    if (!sibling) return;
+    if (direction < 0) item.parentElement.insertBefore(item, sibling);
+    else item.parentElement.insertBefore(sibling, item);
+    refreshNavigationControls();
+}
+
+async function saveNavigationOrder() {
+    const order = [...document.querySelectorAll('#navigationOrderList .nav-order-item')]
+        .map(item => item.dataset.key);
+    try {
+        const response = await fetch('/api/settings', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({navigation_order: order}),
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || '保存失败');
+        showToast('Tab 顺序已保存');
+        setTimeout(() => window.location.reload(), 350);
+    } catch (error) { showToast(error.message, 'error'); }
+}
+
+refreshNavigationControls();
+
 async function saveApiSettings() {
     const settings = {
         llm_api_key: document.getElementById('llm_api_key').value,
@@ -308,6 +393,7 @@ async function saveApiSettings() {
         llm_proxy: document.getElementById('llm_proxy').value,
         llm_model: document.getElementById('llm_model').value,
         llm_vision_model: document.getElementById('llm_vision_model').value,
+        intervals_api_key: document.getElementById('intervals_api_key') ? document.getElementById('intervals_api_key').value : '',
     };
     try {
         const resp = await fetch('/api/settings', {
@@ -330,7 +416,6 @@ async function saveAthleteSettings() {
     const constraints = document.getElementById('athlete_constraints').value
         .split('\n').filter(l => l.trim());
     const settings = {
-        athlete_ftp: document.getElementById('athlete_ftp').value,
         athlete_max_hr: document.getElementById('athlete_max_hr').value,
         athlete_resting_hr: document.getElementById('athlete_resting_hr').value,
         athlete_goal: document.getElementById('athlete_goal').value,
@@ -392,10 +477,45 @@ async function syncGarmin(type) {
     el.style.display = 'block';
     el.style.background = 'rgba(100,210,255,0.1)';
     el.style.color = 'var(--teal)';
-    el.textContent = type === 'wellness' ? '正在同步健康数据...' : '正在同步活动数据...';
+    
+    if (type === 'all') {
+        el.textContent = '正在同步活动和健康数据 (可能需要较长时间)...';
+    } else {
+        el.textContent = type === 'wellness' ? '正在同步健康数据...' : '正在同步活动数据...';
+    }
 
     try {
         const resp = await fetch('/api/sync-garmin', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ type: type }),
+        });
+        const result = await resp.json();
+        if (result.ok) {
+            el.style.background = 'rgba(48,209,88,0.1)';
+            el.style.color = 'var(--green)';
+            el.textContent = result.message || '同步成功';
+        } else {
+            el.style.background = 'rgba(255,69,58,0.1)';
+            el.style.color = 'var(--red)';
+            el.textContent = '失败: ' + (result.detail || JSON.stringify(result));
+        }
+    } catch (e) {
+        el.style.background = 'rgba(255,69,58,0.1)';
+        el.style.color = 'var(--red)';
+        el.textContent = '请求失败: ' + e.message;
+    }
+}
+
+async function syncIntervals(type) {
+    const el = document.getElementById('intervalsSyncResult');
+    el.style.display = 'block';
+    el.style.background = 'rgba(255,159,10,0.1)';
+    el.style.color = 'var(--orange)';
+    el.textContent = type === 'wellness' ? '正在同步健康数据...' : '正在同步活动数据并校验...';
+
+    try {
+        const resp = await fetch('/api/sync-intervals', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ type: type }),

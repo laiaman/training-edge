@@ -1,0 +1,13 @@
+# 统一换行符，防止 CRLF 破坏 shell 脚本（历史教训：start_server.sh 曾因 \r 无法执行）
+* text=auto eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.html text eol=lf
+*.md text eol=lf
+*.plist text eol=lf
+
+# 二进制文件
+*.db binary
+*.fit binary
+*.png binary
+*.jpg binary

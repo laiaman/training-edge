@@ -10,21 +10,33 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-DB_PATH = Path(
-    os.environ.get("TRAININGEDGE_DB_PATH",
-                    str(Path(__file__).resolve().parents[1] / "state" / "training_edge.db"))
-)
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-def _ensure_db_dir():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+def _resolve_db_path() -> Path:
+    """解析数据库路径：支持 ~ 展开；相对路径以项目根为基准（而非 CWD）。"""
+    raw = os.environ.get("TRAININGEDGE_DB_PATH")
+    if not raw:
+        return _PROJECT_ROOT / "state" / "training_edge.db"
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        p = _PROJECT_ROOT / p
+    return p.resolve()
+
+
+DB_PATH = _resolve_db_path()
+
+
+def _ensure_db_dir(db_path: Path):
+    db_path.parent.mkdir(parents=True, exist_ok=True)
 
 
 @contextmanager
-def get_db(db_path: Path = DB_PATH):
+def get_db(db_path: Optional[Path] = None):
     """Context manager for database connections."""
-    _ensure_db_dir()
-    conn = sqlite3.connect(str(db_path))
+    resolved_path = Path(db_path) if db_path is not None else _resolve_db_path()
+    _ensure_db_dir(resolved_path)
+    conn = sqlite3.connect(str(resolved_path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
@@ -38,7 +50,7 @@ def get_db(db_path: Path = DB_PATH):
         conn.close()
 
 
-def init_db(db_path: Path = DB_PATH):
+def init_db(db_path: Optional[Path] = None):
     """Create all tables if they don't exist."""
     with get_db(db_path) as conn:
         conn.executescript("""
@@ -243,17 +255,50 @@ def init_db(db_path: Path = DB_PATH):
             sport TEXT NOT NULL,
             title TEXT,
             description TEXT,
+            target_distance_km REAL,
             target_duration_min REAL,
             target_tss REAL,
             target_intensity TEXT,
+            target_pace_text TEXT,
+            target_hr_min INTEGER,
+            target_hr_max INTEGER,
+            target_hr_text TEXT,
+            target_rpe REAL,
+            target_rpe_min REAL,
+            target_rpe_max REAL,
+            target_duration_source TEXT,
+            target_tss_source TEXT,
+            workout_steps_json TEXT,
+            coach_note TEXT,
+            source_reference TEXT,
+            week_label TEXT,
+            phase TEXT,
+            workout_type TEXT,
+            is_key_workout INTEGER DEFAULT 0,
+            safety_cutoff TEXT,
+            source_uid TEXT,
+            plan_revision INTEGER,
             muscle_groups_json TEXT,
             exercises_json TEXT,
             actual_activity_id TEXT,
+            actual_activity_count INTEGER DEFAULT 0,
+            actual_distance_km REAL,
             actual_tss REAL,
             actual_duration_min REAL,
             compliance_status TEXT DEFAULT 'pending',
             created_at TEXT DEFAULT (datetime('now')),
             FOREIGN KEY (plan_id) REFERENCES training_plans(id)
+        );
+
+        -- One planned workout may be completed by several same-day activities.
+        CREATE TABLE IF NOT EXISTS planned_workout_activity_links (
+            planned_workout_id INTEGER NOT NULL,
+            activity_id INTEGER NOT NULL UNIQUE,
+            match_method TEXT NOT NULL DEFAULT 'same_day_auto',
+            linked_at TEXT DEFAULT (datetime('now')),
+            PRIMARY KEY (planned_workout_id, activity_id),
+            FOREIGN KEY (planned_workout_id) REFERENCES planned_workouts(id) ON DELETE CASCADE,
+            FOREIGN KEY (activity_id) REFERENCES activities(id) ON DELETE CASCADE
         );
 
         -- Muscle fatigue tracking
@@ -291,10 +336,102 @@ def init_db(db_path: Path = DB_PATH):
             metrics_used_json TEXT
         );
 
+        -- Hermes garmin.db import artifacts (optional, to avoid re-calling Garmin API)
+        CREATE TABLE IF NOT EXISTS hermes_activity_raw (
+            activity_id INTEGER PRIMARY KEY,
+            calendar_date TEXT,
+            activity_type TEXT,
+            start_time_local TEXT,
+            activity_name TEXT,
+            raw_json TEXT,
+            imported_at TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS hermes_activity_weather (
+            activity_id INTEGER PRIMARY KEY,
+            temperature_f REAL,
+            humidity REAL,
+            wind_speed_mph REAL,
+            wind_direction TEXT,
+            condition TEXT,
+            feels_like_f REAL,
+            raw_json TEXT,
+            imported_at TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS hermes_activity_notes (
+            activity_id INTEGER PRIMARY KEY,
+            calendar_date TEXT,
+            subjective_notes TEXT,
+            pushed_to_garmin INTEGER,
+            created_at TEXT,
+            imported_at TEXT DEFAULT (datetime('now'))
+        );
+
         CREATE INDEX IF NOT EXISTS idx_body_comp_date ON body_composition(date);
-        CREATE INDEX IF NOT EXISTS idx_planned_workouts_date ON planned_workouts(date);
-        CREATE INDEX IF NOT EXISTS idx_planned_workouts_plan ON planned_workouts(plan_id);
+        CREATE TABLE IF NOT EXISTS plan_change_proposals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            base_revision INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            reason TEXT,
+            changes_json TEXT NOT NULL,
+            created_at TEXT DEFAULT (datetime('now')),
+            applied_at TEXT
+        );
         """)
+
+        # Lightweight additive migrations for databases created before the
+        # structured running-plan model. Existing activity/history data stays intact.
+        existing_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(planned_workouts)").fetchall()
+        }
+        additions = {
+            "plan_id": "INTEGER",
+            "title": "TEXT",
+            "description": "TEXT",
+            "target_distance_km": "REAL",
+            "target_duration_min": "REAL",
+            "target_tss": "REAL",
+            "target_intensity": "TEXT",
+            "target_pace_text": "TEXT",
+            "target_hr_min": "INTEGER",
+            "target_hr_max": "INTEGER",
+            "target_hr_text": "TEXT",
+            "target_rpe": "REAL",
+            "target_rpe_min": "REAL",
+            "target_rpe_max": "REAL",
+            "target_duration_source": "TEXT",
+            "target_tss_source": "TEXT",
+            "workout_steps_json": "TEXT",
+            "coach_note": "TEXT",
+            "source_reference": "TEXT",
+            "muscle_groups_json": "TEXT",
+            "compliance_status": "TEXT DEFAULT 'pending'",
+            "actual_activity_id": "INTEGER",
+            "actual_activity_count": "INTEGER DEFAULT 0",
+            "actual_distance_km": "REAL",
+            "created_at": "TEXT",
+            "week_label": "TEXT",
+            "phase": "TEXT",
+            "workout_type": "TEXT",
+            "is_key_workout": "INTEGER DEFAULT 0",
+            "safety_cutoff": "TEXT",
+            "source_uid": "TEXT",
+            "plan_revision": "INTEGER",
+        }
+        for column, declaration in additions.items():
+            if column not in existing_columns:
+                conn.execute(f"ALTER TABLE planned_workouts ADD COLUMN {column} {declaration}")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_planned_workouts_date ON planned_workouts(date)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_planned_workouts_plan ON planned_workouts(plan_id)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_workout_activity_links_plan "
+            "ON planned_workout_activity_links(planned_workout_id)"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_planned_workouts_source_uid "
+            "ON planned_workouts(source_uid) WHERE source_uid IS NOT NULL"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -615,7 +752,12 @@ def upsert_planned_workout(conn: sqlite3.Connection, data: Dict[str, Any]):
     """Insert or update a planned workout."""
     fields = [
         'plan_id', 'date', 'sport', 'title', 'description',
-        'target_duration_min', 'target_tss', 'target_intensity',
+        'target_distance_km', 'target_duration_min', 'target_tss', 'target_intensity',
+        'target_pace_text', 'target_hr_min', 'target_hr_max', 'target_hr_text',
+        'target_rpe', 'target_rpe_min', 'target_rpe_max', 'target_duration_source',
+        'target_tss_source', 'workout_steps_json', 'coach_note', 'source_reference',
+        'week_label', 'phase',
+        'workout_type', 'is_key_workout', 'safety_cutoff', 'source_uid', 'plan_revision',
         'muscle_groups_json', 'exercises_json', 'actual_activity_id',
         'actual_tss', 'actual_duration_min', 'compliance_status',
     ]
@@ -639,6 +781,11 @@ def upsert_planned_workout(conn: sqlite3.Connection, data: Dict[str, Any]):
 
 def delete_planned_workout(conn: sqlite3.Connection, workout_id: int):
     """Delete a planned workout by ID."""
+    row = conn.execute(
+        "SELECT compliance_status FROM planned_workouts WHERE id=?", (workout_id,)
+    ).fetchone()
+    if row and row["compliance_status"] == "completed":
+        raise ValueError("已完成训练不能删除")
     conn.execute("DELETE FROM planned_workouts WHERE id=?", (workout_id,))
     conn.commit()
 
@@ -699,171 +846,187 @@ def get_muscle_fatigue(conn: sqlite3.Connection, on_date: str) -> Dict[str, floa
     return result
 
 
-def match_compliance(conn: sqlite3.Connection, activity_date: str = None):
-    """Auto-match actual activities to planned workouts using weekly fuzzy matching.
+def _sport_family(sport: str) -> str:
+    if sport in ('running', 'trail_running', 'treadmill_running'):
+        return 'running'
+    if sport in ('training', 'strength_training', 'cardio_training'):
+        return 'training'
+    return sport
 
-    Logic (v2 — weekly fuzzy):
-    1. Determine the ISO week that each pending planned workout belongs to.
-    2. Collect all unmatched activities in the same week with a matching sport.
-    3. Pick the activity whose TSS is closest to the plan's target_tss.
-       If target_tss is NULL / 0, prefer the activity closest in date.
-    4. Mark the planned workout as 'completed' with the matched activity.
-    5. Only mark a workout as 'missed' after the entire week has passed
-       (i.e. today > Sunday of that plan week), so swapping days within a
-       week is allowed.
 
-    Sport mapping: 'training' plans match 'strength_training' / 'training' /
-    'cardio_training' activities.
-    """
+def _reconcile_compliance_range(
+    conn: sqlite3.Connection, date_from: str, date_to: str
+) -> int:
+    """Rebuild same-day plan evidence and aggregate split activities."""
     import datetime as _dt
+
     today = date.today()
-    today_iso = today.isoformat()
-
-    # ── helpers ──────────────────────────────────────────────────────
-    def _week_bounds(d: date):
-        """Return (monday, sunday) for the ISO week containing *d*."""
-        monday = d - _dt.timedelta(days=d.weekday())
-        sunday = monday + _dt.timedelta(days=6)
-        return monday, sunday
-
-    def _parse_date(s: str) -> date:
-        return date.fromisoformat(s)
-
-    # ── date range ───────────────────────────────────────────────────
-    if activity_date:
-        ref = _parse_date(activity_date)
-        monday, sunday = _week_bounds(ref)
-        date_from = monday.isoformat()
-        date_to = sunday.isoformat()
-    else:
-        # Cover the current week + previous 2 weeks
-        monday, _ = _week_bounds(today)
-        date_from = (monday - _dt.timedelta(weeks=2)).isoformat()
-        date_to = today_iso
-
-    # ── pending + missed plans (missed can be re-matched by weekly fuzzy) ──
-    pending = conn.execute(
-        """SELECT id, date, sport, target_tss FROM planned_workouts
-           WHERE date >= ? AND date <= ? AND compliance_status IN ('pending', 'missed')
+    plans = conn.execute(
+        """SELECT * FROM planned_workouts
+           WHERE date >= ? AND date <= ? AND sport NOT IN ('rest', 'stretch')
            ORDER BY date, id""",
         (date_from, date_to),
     ).fetchall()
-
-    if not pending:
+    if not plans:
         return 0
 
-    # Sport matching map: planned sport -> possible actual sports
-    sport_map = {
-        'cycling': ['cycling'],
-        'running': ['running'],
-        'training': ['training', 'strength_training', 'cardio_training'],
-        'rest': [],
-    }
-
-    # ── global exclude set (activities already linked to a plan) ─────
-    already_matched_ids = conn.execute(
-        "SELECT actual_activity_id FROM planned_workouts WHERE actual_activity_id IS NOT NULL"
-    ).fetchall()
-    exclude_ids = {str(r['actual_activity_id']) for r in already_matched_ids}
-
-    # ── cache: week-key -> list of activities ────────────────────────
-    _week_activities_cache: dict[str, list] = {}
-
-    def _get_week_activities(pw_date_str: str, possible_sports: list[str]) -> list:
-        """Return activities in the same ISO week with matching sport."""
-        pw_d = _parse_date(pw_date_str)
-        mon, sun = _week_bounds(pw_d)
-        cache_key = f"{mon.isoformat()}|{'|'.join(sorted(possible_sports))}"
-        if cache_key not in _week_activities_cache:
-            sport_ph = ','.join(['?'] * len(possible_sports))
-            rows = conn.execute(
-                f"""SELECT id, date, tss, total_timer_s, sport FROM activities
-                    WHERE date >= ? AND date <= ? AND sport IN ({sport_ph})
-                    ORDER BY date, start_time""",
-                (mon.isoformat(), sun.isoformat(), *possible_sports),
-            ).fetchall()
-            _week_activities_cache[cache_key] = rows
-        return _week_activities_cache[cache_key]
-
-    # ── matching loop ────────────────────────────────────────────────
-    matched = 0
-    for pw in pending:
-        pw_date = pw['date']
-        pw_sport = pw['sport']
-
-        # Skip rest days
-        if pw_sport in ('rest', 'stretch'):
-            continue
-
-        possible_sports = sport_map.get(pw_sport, [pw_sport])
-        if not possible_sports:
-            continue
-
-        candidates = _get_week_activities(pw_date, possible_sports)
-
-        # Filter out already-matched activities
-        available = [a for a in candidates if str(a['id']) not in exclude_ids]
-        if not available:
-            continue
-
-        # Pick best match: closest TSS if target_tss is set, else closest date
-        target_tss = pw['target_tss'] or 0
-
-        def _score(act):
-            act_tss = act['tss'] or 0
-            # For strength training without TSS, estimate from duration
-            if act_tss == 0 and act['sport'] in ('training', 'strength_training', 'cardio_training'):
-                dur_min = (act['total_timer_s'] or 0) / 60.0
-                act_tss = dur_min * 0.6
-            tss_diff = abs(act_tss - target_tss) if target_tss > 0 else 0
-            date_diff = abs((_parse_date(act['date']) - _parse_date(pw_date)).days)
-            # Primary: TSS distance; secondary: date distance
-            return (tss_diff, date_diff)
-
-        best = min(available, key=_score)
-
-        actual_tss = best['tss']
-        actual_duration = round(best['total_timer_s'] / 60.0, 1) if best['total_timer_s'] else None
-
-        # Estimate TSS for strength training without power data
-        if actual_tss is None and best['sport'] in ('training', 'strength_training', 'cardio_training'):
-            if actual_duration:
-                actual_tss = round(actual_duration * 0.6)
-
-        conn.execute(
-            """UPDATE planned_workouts
-               SET compliance_status = 'completed',
-                   actual_activity_id = ?,
-                   actual_tss = ?,
-                   actual_duration_min = ?
-               WHERE id = ?""",
-            (str(best['id']), actual_tss, actual_duration, pw['id']),
-        )
-        exclude_ids.add(str(best['id']))
-        matched += 1
-
-    # ── mark missed: only after the ENTIRE week has passed ───────────
-    # A workout is 'missed' only if today > Sunday of the plan's week
-    still_pending = conn.execute(
-        """SELECT id, date FROM planned_workouts
-           WHERE date >= ? AND date <= ? AND compliance_status = 'pending'
-           AND sport NOT IN ('rest', 'stretch')""",
+    # Remove links that violate the hard date/sport boundary.
+    linked_rows = conn.execute(
+        """SELECT l.planned_workout_id, l.activity_id,
+                  pw.date AS plan_date, pw.sport AS plan_sport,
+                  a.date AS activity_date, a.sport AS activity_sport
+           FROM planned_workout_activity_links l
+           JOIN planned_workouts pw ON pw.id=l.planned_workout_id
+           LEFT JOIN activities a ON a.id=l.activity_id
+           WHERE pw.date >= ? AND pw.date <= ?""",
         (date_from, date_to),
     ).fetchall()
-
-    for wp in still_pending:
-        wp_d = _parse_date(wp['date'])
-        _, week_sunday = _week_bounds(wp_d)
-        if today > week_sunday:
+    for row in linked_rows:
+        if (
+            row['activity_date'] != row['plan_date']
+            or _sport_family(row['activity_sport'] or '') != _sport_family(row['plan_sport'])
+        ):
             conn.execute(
-                "UPDATE planned_workouts SET compliance_status = 'missed' WHERE id = ?",
-                (wp['id'],),
+                """DELETE FROM planned_workout_activity_links
+                   WHERE planned_workout_id=? AND activity_id=?""",
+                (row['planned_workout_id'], row['activity_id']),
             )
 
-    return matched
+    # Preserve valid legacy one-to-one links while migrating to the link table.
+    legacy_rows = conn.execute(
+        """SELECT pw.id AS planned_workout_id, pw.date AS plan_date,
+                  pw.sport AS plan_sport, pw.actual_activity_id,
+                  a.id AS activity_id, a.date AS activity_date, a.sport AS activity_sport
+           FROM planned_workouts pw
+           LEFT JOIN activities a
+             ON CAST(a.id AS TEXT)=CAST(pw.actual_activity_id AS TEXT)
+           WHERE pw.date >= ? AND pw.date <= ?
+             AND pw.actual_activity_id IS NOT NULL""",
+        (date_from, date_to),
+    ).fetchall()
+    for row in legacy_rows:
+        if (
+            row['activity_id'] is not None
+            and row['activity_date'] == row['plan_date']
+            and _sport_family(row['activity_sport']) == _sport_family(row['plan_sport'])
+        ):
+            conn.execute(
+                """INSERT OR IGNORE INTO planned_workout_activity_links
+                   (planned_workout_id, activity_id, match_method)
+                   VALUES (?, ?, 'legacy_same_day')""",
+                (row['planned_workout_id'], row['activity_id']),
+            )
+
+    plans_by_day_family: Dict[tuple[str, str], list] = {}
+    for plan in plans:
+        key = (plan['date'], _sport_family(plan['sport']))
+        plans_by_day_family.setdefault(key, []).append(plan)
+
+    activities = conn.execute(
+        """SELECT id, date, sport FROM activities
+           WHERE date >= ? AND date <= ? ORDER BY date, start_time""",
+        (date_from, date_to),
+    ).fetchall()
+    activities_by_day_family: Dict[tuple[str, str], list] = {}
+    for activity in activities:
+        family = _sport_family(activity['sport'])
+        if family in {'running', 'training'}:
+            activities_by_day_family.setdefault((activity['date'], family), []).append(activity)
+
+    # With one compatible plan that day, every split belongs to that plan.
+    # Multiple same-sport plans are ambiguous and require explicit linking.
+    for key, day_plans in plans_by_day_family.items():
+        if len(day_plans) != 1:
+            continue
+        plan_id = day_plans[0]['id']
+        for activity in activities_by_day_family.get(key, []):
+            conn.execute(
+                """INSERT OR IGNORE INTO planned_workout_activity_links
+                   (planned_workout_id, activity_id, match_method)
+                   VALUES (?, ?, 'same_day_auto')""",
+                (plan_id, activity['id']),
+            )
+
+    matched_workouts = 0
+    for plan in plans:
+        aggregate = conn.execute(
+            """SELECT count(*) AS activity_count,
+                      coalesce(sum(a.distance_m), 0) / 1000.0 AS distance_km,
+                      coalesce(sum(a.total_timer_s), 0) / 60.0 AS duration_min,
+                      sum(a.tss) AS total_tss,
+                      min(a.id) AS primary_activity_id
+               FROM planned_workout_activity_links l
+               JOIN activities a ON a.id=l.activity_id
+               WHERE l.planned_workout_id=?""",
+            (plan['id'],),
+        ).fetchone()
+        activity_count = int(aggregate['activity_count'] or 0)
+        actual_distance_km = float(aggregate['distance_km'] or 0)
+        actual_duration_min = float(aggregate['duration_min'] or 0)
+        actual_tss = aggregate['total_tss']
+        if actual_tss is None and activity_count and _sport_family(plan['sport']) == 'training':
+            actual_tss = round(actual_duration_min * 0.6, 1)
+
+        if activity_count:
+            if _sport_family(plan['sport']) == 'running' and (plan['target_distance_km'] or 0) > 0:
+                completion_ratio = actual_distance_km / float(plan['target_distance_km'])
+            elif (plan['target_duration_min'] or 0) > 0:
+                completion_ratio = actual_duration_min / float(plan['target_duration_min'])
+            else:
+                completion_ratio = 1.0
+            status = 'completed' if completion_ratio >= 0.8 else 'partial'
+        else:
+            plan_date = date.fromisoformat(plan['date'])
+            week_sunday = plan_date + _dt.timedelta(days=6 - plan_date.weekday())
+            status = 'missed' if today > week_sunday else 'pending'
+
+        if status in {'completed', 'partial'} and plan['compliance_status'] not in {'completed', 'partial'}:
+            matched_workouts += 1
+        conn.execute(
+            """UPDATE planned_workouts
+               SET compliance_status=?, actual_activity_id=?,
+                   actual_activity_count=?, actual_distance_km=?,
+                   actual_duration_min=?, actual_tss=?
+               WHERE id=?""",
+            (
+                status,
+                str(aggregate['primary_activity_id']) if aggregate['primary_activity_id'] is not None else None,
+                activity_count,
+                round(actual_distance_km, 3) if activity_count else None,
+                round(actual_duration_min, 1) if activity_count else None,
+                actual_tss,
+                plan['id'],
+            ),
+        )
+    return matched_workouts
 
 
-# ---------------------------------------------------------------------------
+def reconcile_all_compliance(conn: sqlite3.Connection) -> int:
+    """Rebuild execution evidence for the full structured-plan date range."""
+    bounds = conn.execute(
+        """SELECT min(date) AS date_from, max(date) AS date_to
+           FROM planned_workouts"""
+    ).fetchone()
+    if not bounds or not bounds['date_from'] or not bounds['date_to']:
+        return 0
+    return _reconcile_compliance_range(conn, bounds['date_from'], bounds['date_to'])
+
+
+def match_compliance(conn: sqlite3.Connection, activity_date: str = None):
+    """Reconcile same-day activity aggregates for an active week range."""
+    import datetime as _dt
+
+    today = date.today()
+    if activity_date:
+        reference = date.fromisoformat(activity_date)
+        monday = reference - _dt.timedelta(days=reference.weekday())
+        sunday = monday + _dt.timedelta(days=6)
+        date_from, date_to = monday.isoformat(), sunday.isoformat()
+    else:
+        monday = today - _dt.timedelta(days=today.weekday())
+        date_from = (monday - _dt.timedelta(weeks=2)).isoformat()
+        date_to = today.isoformat()
+    return _reconcile_compliance_range(conn, date_from, date_to)
 # Activity AI Reviews
 # ---------------------------------------------------------------------------
 

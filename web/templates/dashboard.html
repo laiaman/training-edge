@@ -7,7 +7,51 @@
     <div class="subtitle">Personal Training Decision Cockpit</div>
 </div>
 
-{# ═══ 模块 1: 今日结论卡 (ReadinessCard) ═══ #}
+{# ═══ 目标赛事倒计时 ═══ #}
+{% if race_info and race_info.days_left is not none %}
+<div class="card" style="margin:16px 0 0 0; border-radius:14px; padding:14px 20px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; border-left:3px solid var(--pink);">
+    <div style="display:flex; align-items:center; gap:10px;">
+        <span style="font-size:16px;">🏁</span>
+        <span style="font-size:15px; font-weight:600;">{{ race_info.name }}</span>
+        <span style="font-size:12px; color:var(--text-tertiary);">{{ race_info.date }} · 目标 {{ race_info.target }}</span>
+    </div>
+    <div style="display:flex; align-items:baseline; gap:6px;">
+        <span style="font-size:24px; font-weight:700; color:var(--pink); font-variant-numeric:tabular-nums;">{{ race_info.days_left }}</span>
+        <span style="font-size:13px; color:var(--text-secondary);">天</span>
+        <span style="font-size:12px; color:var(--text-tertiary);">（约 {{ race_info.weeks_left }} 周）</span>
+    </div>
+</div>
+{% endif %}
+
+{# ═══ 模块 0: 今日焦点 — "今天练什么" 放在最顶部 ═══ #}
+{% if today_plan and today_plan|length > 0 %}
+<div class="card" style="margin:16px 0; border-radius:16px; padding:20px 24px; border-left:3px solid var(--teal);">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+        <div style="font-size:13px; font-weight:600; color:var(--teal); letter-spacing:0.5px;">📋 今日训练</div>
+        <a href="/plan" style="font-size:12px; color:var(--blue); text-decoration:none;">查看完整计划 →</a>
+    </div>
+    {% for pw in today_plan %}
+    <div style="{% if not loop.first %}margin-top:10px; padding-top:10px; border-top:0.5px solid var(--glass-border);{% endif %}">
+        <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+            <span style="font-size:17px; font-weight:700; color:var(--text-primary);">{{ pw.title or '未命名' }}</span>
+            {% if pw.sport == 'running' %}<span class="pill pill-green" style="font-size:11px;">🏃 跑步</span>
+            {% elif pw.sport == 'training' %}<span class="pill pill-purple" style="font-size:11px;">💪 力量</span>
+            {% endif %}
+        </div>
+        {% if pw.description %}
+        <div style="font-size:13px; color:var(--text-secondary); margin-top:6px; line-height:1.6; white-space:pre-line;">{{ pw.description }}</div>
+        {% endif %}
+        <div style="display:flex; gap:16px; margin-top:8px; font-size:12px; color:var(--text-tertiary);">
+            {% if pw.target_duration_min %}<span>⏱ {{ '%.0f'|format(pw.target_duration_min) }} 分钟</span>{% endif %}
+            {% if pw.target_tss %}<span title="TSS（训练压力分数）">📊 TSS {{ '%.0f'|format(pw.target_tss) }}</span>{% endif %}
+            {% if pw.target_intensity %}<span>🎯 {{ pw.target_intensity }}</span>{% endif %}
+        </div>
+    </div>
+    {% endfor %}
+</div>
+{% endif %}
+
+{# ═══ 模块 1: 今日状态评估（作为决策依据，放在焦点卡下方） ═══ #}
 {% set r = readiness %}
 <div class="card" style="margin:16px 0; border-radius:16px; padding:24px;
     {% if r.status == '可执行关键课' %}border-left:3px solid var(--green);
@@ -25,156 +69,187 @@
                 {% elif r.status == '建议休息' %}🔴
                 {% else %}⚪{% endif %}
             </span>
-            <span style="font-size:20px; font-weight:700; letter-spacing:-0.3px;">今日状态：{{ r.status }}</span>
+            <span style="font-size:20px; font-weight:700; letter-spacing:-0.3px;">{{ r.status }}</span>
         </div>
         <span class="pill {% if r.confidence == '高' %}pill-green{% elif r.confidence == '中' %}pill-orange{% else %}pill-red{% endif %}">
             置信度：{{ r.confidence }}
         </span>
     </div>
 
-    {% if r.confidence_reasons %}
-    <div style="margin-top:6px; font-size:12px; color:var(--text-tertiary);">
-        {% for reason in r.confidence_reasons %}
-        <div>· {{ reason }}</div>
-        {% endfor %}
-    </div>
-    {% endif %}
-
-    {% if r.reasons %}
-    <div style="margin-top:12px; font-size:14px; color:var(--text-secondary); line-height:1.7;">
-        依据：{{ r.reasons | join(' · ') }}
-    </div>
-    {% endif %}
-
     <div style="margin-top:8px; font-size:14px; color:var(--text-primary);">
         💡 {{ r.suggestion }}
     </div>
 
-    {% if r.today_plan_type %}
-    <div style="margin-top:8px; font-size:13px; color:var(--text-tertiary);">
-        今日计划类型：{{ r.today_plan_type }}
-    </div>
-    {% endif %}
-
     {# 展开详细依据 #}
     {% if r.scoring %}
     <details style="margin-top:12px;">
-        <summary style="font-size:13px; color:var(--blue); cursor:pointer; font-weight:500;">展开详细依据 ▼</summary>
-        <div style="margin-top:12px; background:rgba(255,255,255,0.03); border-radius:10px; padding:14px; overflow-x:auto;">
-            <table style="font-size:13px;">
-                <thead>
-                    <tr>
-                        <th style="padding:6px 12px;">指标</th>
-                        <th style="padding:6px 12px;">当前值</th>
-                        <th style="padding:6px 12px;">评估</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {% if r.raw_data.hrv is not none %}
-                    <tr>
-                        <td style="padding:6px 12px;">HRV</td>
-                        <td style="padding:6px 12px;">{{ '%.0f'|format(r.raw_data.hrv) }} ms{% if r.raw_data.hrv_7d_mean %} (7日均 {{ '%.0f'|format(r.raw_data.hrv_7d_mean) }}){% endif %}</td>
-                        <td style="padding:6px 12px;">
-                            {% if r.scoring.hrv == '正常' %}<span class="pill pill-green">{{ r.scoring.hrv }}</span>
-                            {% elif r.scoring.hrv == '偏低' or r.scoring.hrv == '异常低' %}<span class="pill pill-red">{{ r.scoring.hrv }}</span>
-                            {% else %}<span class="pill pill-teal">{{ r.scoring.hrv }}</span>{% endif %}
-                        </td>
-                    </tr>
-                    {% endif %}
-                    {% if r.raw_data.resting_hr is not none %}
-                    <tr>
-                        <td style="padding:6px 12px;">静息心率</td>
-                        <td style="padding:6px 12px;">{{ '%.0f'|format(r.raw_data.resting_hr) }} bpm{% if r.raw_data.rhr_7d_mean %} (7日均 {{ '%.0f'|format(r.raw_data.rhr_7d_mean) }}){% endif %}</td>
-                        <td style="padding:6px 12px;">
-                            {% if r.scoring.rhr == '正常' %}<span class="pill pill-green">{{ r.scoring.rhr }}</span>
-                            {% elif r.scoring.rhr in ('偏高', '异常高') %}<span class="pill pill-red">{{ r.scoring.rhr }}</span>
-                            {% else %}<span class="pill pill-teal">{{ r.scoring.rhr }}</span>{% endif %}
-                        </td>
-                    </tr>
-                    {% endif %}
-                    {% if r.raw_data.sleep_hours is not none %}
-                    <tr>
-                        <td style="padding:6px 12px;">睡眠</td>
-                        <td style="padding:6px 12px;">{{ '%.1f'|format(r.raw_data.sleep_hours) }}h{% if r.raw_data.sleep_7d_mean %} (7日均 {{ '%.1f'|format(r.raw_data.sleep_7d_mean) }}h){% endif %}</td>
-                        <td style="padding:6px 12px;">
-                            {% if r.scoring.sleep == '正常' %}<span class="pill pill-green">{{ r.scoring.sleep }}</span>
-                            {% elif r.scoring.sleep in ('差', '偏低') %}<span class="pill pill-red">{{ r.scoring.sleep }}</span>
-                            {% else %}<span class="pill pill-teal">{{ r.scoring.sleep }}</span>{% endif %}
-                        </td>
-                    </tr>
-                    {% endif %}
-                    {% if r.raw_data.tsb is not none %}
-                    <tr>
-                        <td style="padding:6px 12px;">TSB</td>
-                        <td style="padding:6px 12px;">{{ '%.1f'|format(r.raw_data.tsb) }} (CTL {{ '%.0f'|format(r.raw_data.ctl) if r.raw_data.ctl else '—' }} / ATL {{ '%.0f'|format(r.raw_data.atl) if r.raw_data.atl else '—' }})</td>
-                        <td style="padding:6px 12px;">
-                            {% if r.scoring.tsb in ('恢复充分', '可训练') %}<span class="pill pill-green">{{ r.scoring.tsb }}</span>
-                            {% elif r.scoring.tsb == '疲劳' %}<span class="pill pill-orange">{{ r.scoring.tsb }}</span>
-                            {% elif r.scoring.tsb == '高风险' %}<span class="pill pill-red">{{ r.scoring.tsb }}</span>
-                            {% else %}<span class="pill pill-teal">{{ r.scoring.tsb }}</span>{% endif %}
-                        </td>
-                    </tr>
-                    {% endif %}
-                </tbody>
-            </table>
+        <summary style="font-size:13px; color:var(--blue); cursor:pointer; font-weight:500;">查看评估依据 ▼</summary>
+        <div style="margin-top:10px;">
+            {% if r.reasons %}
+            <div style="font-size:13px; color:var(--text-secondary); line-height:1.7; margin-bottom:10px;">
+                {{ r.reasons | join(' · ') }}
+            </div>
+            {% endif %}
+            {% if r.confidence_reasons %}
+            <div style="font-size:12px; color:var(--text-tertiary); margin-bottom:10px;">
+                {% for reason in r.confidence_reasons %}· {{ reason }}{% if not loop.last %}  {% endif %}{% endfor %}
+            </div>
+            {% endif %}
+            <div style="background:rgba(255,255,255,0.03); border-radius:10px; padding:14px; overflow-x:auto;">
+                <table style="font-size:13px;">
+                    <thead>
+                        <tr>
+                            <th style="padding:6px 12px;">指标</th>
+                            <th style="padding:6px 12px;">当前值</th>
+                            <th style="padding:6px 12px;">评估</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% if r.raw_data.hrv is not none %}
+                        <tr>
+                            <td style="padding:6px 12px;">HRV</td>
+                            <td style="padding:6px 12px;">{{ '%.0f'|format(r.raw_data.hrv) }} ms{% if r.raw_data.hrv_7d_mean %} (7日均 {{ '%.0f'|format(r.raw_data.hrv_7d_mean) }}){% endif %}</td>
+                            <td style="padding:6px 12px;">
+                                {% if r.scoring.hrv == '正常' %}<span class="pill pill-green">{{ r.scoring.hrv }}</span>
+                                {% elif r.scoring.hrv == '偏低' or r.scoring.hrv == '异常低' %}<span class="pill pill-red">{{ r.scoring.hrv }}</span>
+                                {% else %}<span class="pill pill-teal">{{ r.scoring.hrv }}</span>{% endif %}
+                            </td>
+                        </tr>
+                        {% endif %}
+                        {% if r.raw_data.resting_hr is not none %}
+                        <tr>
+                            <td style="padding:6px 12px;">静息心率</td>
+                            <td style="padding:6px 12px;">{{ '%.0f'|format(r.raw_data.resting_hr) }} bpm{% if r.raw_data.rhr_7d_mean %} (7日均 {{ '%.0f'|format(r.raw_data.rhr_7d_mean) }}){% endif %}</td>
+                            <td style="padding:6px 12px;">
+                                {% if r.scoring.rhr == '正常' %}<span class="pill pill-green">{{ r.scoring.rhr }}</span>
+                                {% elif r.scoring.rhr in ('偏高', '异常高') %}<span class="pill pill-red">{{ r.scoring.rhr }}</span>
+                                {% else %}<span class="pill pill-teal">{{ r.scoring.rhr }}</span>{% endif %}
+                            </td>
+                        </tr>
+                        {% endif %}
+                        {% if r.raw_data.sleep_hours is not none %}
+                        <tr>
+                            <td style="padding:6px 12px;">睡眠</td>
+                            <td style="padding:6px 12px;">{{ '%.1f'|format(r.raw_data.sleep_hours) }}h{% if r.raw_data.sleep_7d_mean %} (7日均 {{ '%.1f'|format(r.raw_data.sleep_7d_mean) }}h){% endif %}</td>
+                            <td style="padding:6px 12px;">
+                                {% if r.scoring.sleep == '正常' %}<span class="pill pill-green">{{ r.scoring.sleep }}</span>
+                                {% elif r.scoring.sleep in ('差', '偏低') %}<span class="pill pill-red">{{ r.scoring.sleep }}</span>
+                                {% else %}<span class="pill pill-teal">{{ r.scoring.sleep }}</span>{% endif %}
+                            </td>
+                        </tr>
+                        {% endif %}
+                        {% if r.raw_data.tsb is not none %}
+                        <tr>
+                            <td style="padding:6px 12px;" title="TSB = CTL − ATL，反映体能与疲劳的平衡">TSB</td>
+                            <td style="padding:6px 12px;">{{ '%.1f'|format(r.raw_data.tsb) }} (CTL {{ '%.0f'|format(r.raw_data.ctl) if r.raw_data.ctl else '—' }} / ATL {{ '%.0f'|format(r.raw_data.atl) if r.raw_data.atl else '—' }})</td>
+                            <td style="padding:6px 12px;">
+                                {% if r.scoring.tsb in ('恢复充分', '可训练') %}<span class="pill pill-green">{{ r.scoring.tsb }}</span>
+                                {% elif r.scoring.tsb == '疲劳' %}<span class="pill pill-orange">{{ r.scoring.tsb }}</span>
+                                {% elif r.scoring.tsb == '高风险' %}<span class="pill pill-red">{{ r.scoring.tsb }}</span>
+                                {% else %}<span class="pill pill-teal">{{ r.scoring.tsb }}</span>{% endif %}
+                            </td>
+                        </tr>
+                        {% endif %}
+                    </tbody>
+                </table>
+            </div>
         </div>
     </details>
     {% endif %}
 </div>
 
 {% if r.anomaly_alert and r.anomaly_alert.triggered %}
-<div style="background:rgba(255,69,58,0.08); border:0.5px solid rgba(255,69,58,0.3); border-radius:14px; padding:16px 20px; margin:12px 0;">
+<div style="background:{% if r.anomaly_alert.is_data_only %}rgba(255,159,10,0.08){% else %}rgba(255,69,58,0.08){% endif %}; border:0.5px solid {% if r.anomaly_alert.is_data_only %}rgba(255,159,10,0.3){% else %}rgba(255,69,58,0.3){% endif %}; border-radius:14px; padding:16px 20px; margin:12px 0;">
     <div style="display:flex; align-items:center; gap:8px; margin-bottom:6px;">
-        <span style="font-size:16px;">⚠️</span>
-        <span style="font-size:14px; font-weight:600; color:var(--red);">异常复核提示</span>
+        <span style="font-size:16px;">{% if r.anomaly_alert.is_data_only %}📡{% else %}⚠️{% endif %}</span>
+        <span style="font-size:14px; font-weight:600; color:{% if r.anomaly_alert.is_data_only %}var(--orange){% else %}var(--red){% endif %};">
+            {% if r.anomaly_alert.is_data_only %}数据同步提示{% else %}异常复核提示{% endif %}
+        </span>
     </div>
     <div style="font-size:13px; color:var(--text-secondary); line-height:1.7;">
-        {{ r.anomaly_alert.message }}
+        {{ r.anomaly_alert.summary }}
     </div>
-    {% if r.anomaly_alert.conditions %}
-    <div style="margin-top:6px; font-size:12px; color:var(--text-tertiary);">
-        触发原因：{{ r.anomaly_alert.conditions | join('、') }}
+    {% if r.anomaly_alert.details %}
+    <div style="margin-top:8px; display:flex; flex-wrap:wrap; gap:6px;">
+        {% for d in r.anomaly_alert.details %}
+        <span style="font-size:12px; padding:3px 10px; border-radius:6px;
+            background:{% if d.code == 'data_insufficient' %}rgba(255,159,10,0.12){% else %}rgba(255,69,58,0.12){% endif %};
+            color:{% if d.code == 'data_insufficient' %}var(--orange){% else %}var(--red){% endif %};">
+            {{ d.label }}：{{ d.desc }}
+        </span>
+        {% endfor %}
     </div>
     {% endif %}
 </div>
 {% endif %}
 
-{# ═══ 模块 3: 本周执行偏差（移至此处） ═══ #}
+{# ═══ 模块 3: 本周执行进度 ═══ #}
 {% set dev = deviation %}
 {% if dev.planned_count > 0 %}
 <div class="card" style="margin:16px 0; border-radius:14px; padding:20px;">
     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px;">
-        <div class="card-label" style="margin:0;">本周执行偏差</div>
+        <div class="card-label" style="margin:0;">本周执行进度</div>
         <a href="/plan" style="font-size:13px; color:var(--blue); text-decoration:none; font-weight:500;">查看计划 →</a>
     </div>
 
-    {# 训练次数进度 #}
+    {# 训练次数进度（带预期轨迹底色） #}
     <div style="margin-bottom:10px;">
         <div style="display:flex; justify-content:space-between; font-size:13px; margin-bottom:4px;">
             <span style="color:var(--text-secondary);">训练次数</span>
-            <span style="color:var(--text-primary); font-weight:500;">{{ dev.actual_count }}/{{ dev.planned_count }} 次</span>
+            <span style="color:var(--text-primary); font-weight:500;">
+                {{ dev.actual_count }}/{{ dev.planned_count }} 次
+                {% if dev.expected_count_by_today > 0 and dev.expected_count_by_today < dev.planned_count %}
+                <span style="color:var(--text-tertiary); font-weight:400;">（截至今日应 {{ dev.expected_count_by_today }}）</span>
+                {% endif %}
+            </span>
         </div>
-        <div style="height:6px; background:rgba(255,255,255,0.06); border-radius:3px; overflow:hidden;">
+        <div style="height:8px; background:rgba(255,255,255,0.04); border-radius:4px; overflow:hidden; position:relative;">
+            {# 预期轨迹底色：浅色标出截至今日应到的位置 #}
+            {% set expected_count_pct = (dev.expected_count_by_today / dev.planned_count * 100) if dev.planned_count > 0 else 0 %}
+            <div style="position:absolute; top:0; left:0; height:100%; width:{{ [expected_count_pct, 100]|min }}%; background:rgba(10,132,255,0.12); border-radius:4px;"></div>
+            {# 实际完成进度 #}
             {% set pct1 = (dev.actual_count / dev.planned_count * 100) if dev.planned_count > 0 else 0 %}
-            <div style="height:100%; width:{{ [pct1, 100]|min }}%; background:var(--blue); border-radius:3px;"></div>
+            <div style="position:relative; height:100%; width:{{ [pct1, 100]|min }}%; background:var(--blue); border-radius:4px; z-index:1;"></div>
+            {# 时间进度标记线 #}
+            {% if dev.week_progress_pct > 0 and dev.week_progress_pct < 100 %}
+            <div style="position:absolute; top:-2px; bottom:-2px; left:{{ dev.week_progress_pct }}%; width:1.5px; background:rgba(255,255,255,0.35); z-index:2;" title="本周时间进度 {{ '%.0f'|format(dev.week_progress_pct) }}%"></div>
+            {% endif %}
         </div>
     </div>
 
-    {# TSS 进度 #}
+    {# TSS 进度：源数据不完整时明确标为不可用，禁止把 NULL 当 0 #}
     <div style="margin-bottom:12px;">
         <div style="display:flex; justify-content:space-between; font-size:13px; margin-bottom:4px;">
-            <span style="color:var(--text-secondary);">TSS 进度</span>
+            <span style="color:var(--text-secondary);" title="TSS（训练压力分数）= 训练量 × 强度的综合衡量">TSS 进度</span>
+            {% if dev.tss_available %}
             <span style="color:var(--text-primary); font-weight:500;">{{ '%.0f'|format(dev.actual_tss) }}/{{ '%.0f'|format(dev.planned_tss) }} ({{ '%.0f'|format(dev.deviation_pct) }}%)</span>
+            {% else %}
+            <span style="color:var(--text-tertiary); font-weight:500;">实际 TSS 不可用（Garmin 未提供）</span>
+            {% endif %}
         </div>
-        <div style="height:6px; background:rgba(255,255,255,0.06); border-radius:3px; overflow:hidden;">
-            <div style="height:100%; width:{{ [dev.deviation_pct, 100]|min }}%; border-radius:3px;
-                background:{% if dev.deviation_pct >= 85 %}var(--green){% elif dev.deviation_pct >= 60 %}var(--orange){% else %}var(--red){% endif %};"></div>
+        {% if dev.tss_available %}
+        <div style="height:8px; background:rgba(255,255,255,0.04); border-radius:4px; overflow:hidden; position:relative;">
+            {# 预期轨迹底色 #}
+            {% set expected_tss_pct = (dev.expected_tss_by_today / dev.planned_tss * 100) if dev.planned_tss > 0 else 0 %}
+            {% set bar_color = 'var(--green)' if dev.judgment == '正常' else 'var(--orange)' if dev.judgment == '略落后' else 'var(--red)' if dev.judgment in ('过载', '明显落后') else 'var(--blue)' %}
+            <div style="position:absolute; top:0; left:0; height:100%; width:{{ [expected_tss_pct, 100]|min }}%; background:rgba(48,209,88,0.10); border-radius:4px;"></div>
+            <div style="position:relative; height:100%; width:{{ [dev.deviation_pct, 100]|min }}%; border-radius:4px; background:{{ bar_color }}; z-index:1;"></div>
+            {% if dev.week_progress_pct > 0 and dev.week_progress_pct < 100 %}
+            <div style="position:absolute; top:-2px; bottom:-2px; left:{{ dev.week_progress_pct }}%; width:1.5px; background:rgba(255,255,255,0.35); z-index:2;" title="本周时间进度 {{ '%.0f'|format(dev.week_progress_pct) }}%"></div>
+            {% endif %}
         </div>
+        {# 进度条图例 #}
+        <div style="display:flex; gap:12px; margin-top:4px; font-size:11px; color:var(--text-tertiary);">
+            <span><span style="display:inline-block; width:8px; height:8px; border-radius:2px; background:{{ bar_color }}; vertical-align:middle; margin-right:3px;"></span>实际</span>
+            <span><span style="display:inline-block; width:8px; height:8px; border-radius:2px; background:rgba(48,209,88,0.25); vertical-align:middle; margin-right:3px;"></span>截至今日应到</span>
+            <span><span style="display:inline-block; width:1.5px; height:10px; background:rgba(255,255,255,0.35); vertical-align:middle; margin-right:3px;"></span>时间进度</span>
+        </div>
+        {% endif %}
     </div>
 
     {# 判断 #}
-    <div style="display:flex; align-items:center; gap:8px;">
-        <span class="pill {% if dev.judgment == '正常' %}pill-green{% elif dev.judgment == '略落后' %}pill-orange{% elif dev.judgment == '过载' %}pill-red{% else %}pill-red{% endif %}">
+    <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+        <span class="pill {% if dev.judgment == '正常' %}pill-green{% elif dev.judgment == '略落后' %}pill-orange{% elif dev.judgment == '过载' %}pill-red{% elif dev.judgment == '明显落后' %}pill-red{% else %}pill-teal{% endif %}">
             {{ dev.judgment }}
         </span>
         <span style="font-size:13px; color:var(--text-secondary);">{{ dev.suggestion }}</span>
@@ -184,10 +259,10 @@
 
 {# ═══ 模块 2: 关键指标 MetricCards（4卡片） ═══ #}
 {% set mc = metric_cards %}
-<div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(160px, 1fr)); gap:10px; margin:16px 0;">
+<div class="metric-grid" style="display:grid; grid-template-columns:repeat(4, 1fr); gap:10px; margin:16px 0;">
     {# 睡眠 #}
-    <a href="/body-data#sleep-trend" class="card" style="padding:14px 16px; border-radius:14px; text-decoration:none; cursor:pointer;">
-        <div style="font-size:12px; color:var(--text-secondary); margin-bottom:6px;">睡眠</div>
+    <a href="/body-data#sleep-trend" class="card metric-card" style="padding:14px 16px; border-radius:14px; text-decoration:none; cursor:pointer;">
+        <div style="font-size:12px; color:var(--text-secondary); margin-bottom:6px;" title="来自 Garmin 手表的睡眠追踪数据">睡眠</div>
         {% if mc.sleep.value %}
         {% set sh = mc.sleep.value|int %}
         {% set sm = ((mc.sleep.value - sh) * 60)|int %}
@@ -200,12 +275,14 @@
             {{ '+' if mc.sleep.delta_7d > 0 }}{{ '%d'|format((mc.sleep.delta_7d * 60)|int) }}min vs 7日均
         </div>
         {% endif %}
-        <div style="font-size:11px; color:var(--text-tertiary); margin-top:2px;">{{ mc.sleep.date or '' }} · {{ mc.sleep.source }}</div>
+        {% if mc.sleep.range_7d %}
+        <div style="font-size:11px; color:var(--text-tertiary); margin-top:2px;">基线 {{ '%.1f'|format(mc.sleep.range_7d.low) }}–{{ '%.1f'|format(mc.sleep.range_7d.high) }}h</div>
+        {% endif %}
     </a>
 
     {# HRV #}
-    <a href="/body-data#hrv-trend" class="card" style="padding:14px 16px; border-radius:14px; text-decoration:none; cursor:pointer;">
-        <div style="font-size:12px; color:var(--text-secondary); margin-bottom:6px;">HRV</div>
+    <a href="/body-data#hrv-trend" class="card metric-card" style="padding:14px 16px; border-radius:14px; text-decoration:none; cursor:pointer;">
+        <div style="font-size:12px; color:var(--text-secondary); margin-bottom:6px;" title="心率变异性（Heart Rate Variability）— 反映自主神经恢复能力，数值越高表示恢复越好">HRV <span style="font-size:10px; color:var(--text-tertiary);">心率变异性</span></div>
         <div style="font-size:24px; font-weight:700; color:var(--green); letter-spacing:-0.5px; font-variant-numeric:tabular-nums;">
             {{ '%.0f'|format(mc.hrv.value) if mc.hrv.value else '—' }} <span style="font-size:13px; font-weight:500; color:var(--text-secondary);">ms</span>
         </div>
@@ -214,12 +291,14 @@
             {{ '+' if mc.hrv.delta_7d > 0 }}{{ '%.0f'|format(mc.hrv.delta_7d) }} vs 7日均
         </div>
         {% endif %}
-        <div style="font-size:11px; color:var(--text-tertiary); margin-top:2px;">{{ mc.hrv.date or '' }} · {{ mc.hrv.source }}</div>
+        {% if mc.hrv.range_7d %}
+        <div style="font-size:11px; color:var(--text-tertiary); margin-top:2px;">基线 {{ '%.0f'|format(mc.hrv.range_7d.low) }}–{{ '%.0f'|format(mc.hrv.range_7d.high) }}ms</div>
+        {% endif %}
     </a>
 
     {# 静息心率 #}
-    <a href="/body-data#rhr-trend" class="card" style="padding:14px 16px; border-radius:14px; text-decoration:none; cursor:pointer;">
-        <div style="font-size:12px; color:var(--text-secondary); margin-bottom:6px;">静息心率</div>
+    <a href="/body-data#rhr-trend" class="card metric-card" style="padding:14px 16px; border-radius:14px; text-decoration:none; cursor:pointer;">
+        <div style="font-size:12px; color:var(--text-secondary); margin-bottom:6px;" title="静息心率（Resting Heart Rate）— 清晨安静状态下心率，升高可能提示疲劳或生病">静息心率 <span style="font-size:10px; color:var(--text-tertiary);">RHR</span></div>
         <div style="font-size:24px; font-weight:700; color:var(--red); letter-spacing:-0.5px; font-variant-numeric:tabular-nums;">
             {{ '%.0f'|format(mc.resting_hr.value) if mc.resting_hr.value else '—' }} <span style="font-size:13px; font-weight:500; color:var(--text-secondary);">bpm</span>
         </div>
@@ -228,46 +307,60 @@
             {{ '+' if mc.resting_hr.delta_7d > 0 }}{{ '%.0f'|format(mc.resting_hr.delta_7d) }} vs 7日均
         </div>
         {% endif %}
-        <div style="font-size:11px; color:var(--text-tertiary); margin-top:2px;">{{ mc.resting_hr.date or '' }} · {{ mc.resting_hr.source }}</div>
+        {% if mc.resting_hr.range_7d %}
+        <div style="font-size:11px; color:var(--text-tertiary); margin-top:2px;">基线 {{ '%.0f'|format(mc.resting_hr.range_7d.low) }}–{{ '%.0f'|format(mc.resting_hr.range_7d.high) }}bpm</div>
+        {% endif %}
     </a>
 
     {# TSB 体能状态 #}
-    <div class="card" style="padding:14px 16px; border-radius:14px;">
-        <div style="font-size:12px; color:var(--text-secondary); margin-bottom:6px;">体能状态</div>
+    <div class="card metric-card" style="padding:14px 16px; border-radius:14px;">
+        <div style="font-size:12px; color:var(--text-secondary); margin-bottom:6px;" title="体能状态平衡 — CTL（体能）- ATL（疲劳）= TSB（状态），TSB > 0 状态好，TSB < -15 需注意">体能状态 <span style="font-size:10px; color:var(--text-tertiary);">CTL / ATL / TSB</span></div>
         <div style="display:flex; gap:8px; align-items:baseline;">
-            <span style="font-size:18px; font-weight:700; color:var(--blue); font-variant-numeric:tabular-nums;">{{ '%.0f'|format(mc.fitness.ctl) if mc.fitness.ctl else '—' }}</span>
-            <span style="font-size:11px; color:var(--text-tertiary);">CTL</span>
-            <span style="font-size:18px; font-weight:700; color:var(--orange); font-variant-numeric:tabular-nums;">{{ '%.0f'|format(mc.fitness.atl) if mc.fitness.atl else '—' }}</span>
-            <span style="font-size:11px; color:var(--text-tertiary);">ATL</span>
+            <span style="font-size:18px; font-weight:700; color:var(--blue); font-variant-numeric:tabular-nums;" title="CTL（Chronic Training Load）慢性训练负荷 — 过去 42 天训练量的指数加权均值，代表你的长期体能水平">{{ '%.0f'|format(mc.fitness.ctl) if mc.fitness.ctl else '—' }}</span>
+            <span style="font-size:11px; color:var(--text-tertiary);">体能</span>
+            <span style="font-size:18px; font-weight:700; color:var(--orange); font-variant-numeric:tabular-nums;" title="ATL（Acute Training Load）急性训练负荷 — 过去 7 天训练量的指数加权均值，代表近期疲劳程度">{{ '%.0f'|format(mc.fitness.atl) if mc.fitness.atl else '—' }}</span>
+            <span style="font-size:11px; color:var(--text-tertiary);">疲劳</span>
         </div>
         <div style="margin-top:4px;">
             {% set tsb_val = mc.fitness.tsb %}
-            <span style="font-size:16px; font-weight:700; color:{% if tsb_val is not none and tsb_val >= 0 %}var(--green){% elif tsb_val is not none %}var(--red){% else %}var(--text-tertiary){% endif %}; font-variant-numeric:tabular-nums;">
-                TSB {{ '%.1f'|format(tsb_val) if tsb_val is not none else '—' }}
+            <span style="font-size:16px; font-weight:700; color:{% if tsb_val is not none and tsb_val >= 0 %}var(--green){% elif tsb_val is not none %}var(--red){% else %}var(--text-tertiary){% endif %}; font-variant-numeric:tabular-nums;" title="TSB（Training Stress Balance）训练状态平衡 = CTL - ATL。正值表示恢复充分、适合比赛，负值表示有疲劳累积">
+                状态 {{ '%.1f'|format(tsb_val) if tsb_val is not none else '—' }}
             </span>
         </div>
     </div>
 </div>
 
-{# ═══ 近7日训练总览（宽卡片） ═══ #}
+{# ═══ 近7日训练总览（宽卡片，含 ACWR） ═══ #}
 <div class="card" style="margin:10px 0 16px 0; border-radius:14px; padding:16px 20px;">
-    <div style="font-size:12px; color:var(--text-secondary); margin-bottom:8px;">近7日训练总览</div>
+    <div style="font-size:12px; color:var(--text-secondary); margin-bottom:8px;">近 7 日训练总览</div>
     <div style="display:flex; flex-wrap:wrap; gap:16px; align-items:baseline;">
         <div>
             <span style="font-size:22px; font-weight:700; color:var(--teal); font-variant-numeric:tabular-nums;">{{ '%.1f'|format(mc.week_activity.total_hours) if mc.week_activity.total_hours else '0' }}</span>
             <span style="font-size:13px; color:var(--text-secondary);">小时</span>
         </div>
         <div>
-            <span style="font-size:22px; font-weight:700; color:var(--orange); font-variant-numeric:tabular-nums;">{{ '%.0f'|format(mc.week_activity.total_tss) if mc.week_activity.total_tss else '0' }}</span>
+            <span style="font-size:22px; font-weight:700; color:var(--orange); font-variant-numeric:tabular-nums;" title="TSS（Training Stress Score）训练压力分数 — 综合时长和强度的训练量化指标">{{ '%.0f'|format(mc.week_activity.total_tss) if mc.week_activity.total_tss is not none else '—' }}</span>
             <span style="font-size:13px; color:var(--text-secondary);">TSS</span>
         </div>
         <div>
             <span style="font-size:22px; font-weight:700; color:var(--red); font-variant-numeric:tabular-nums;">{{ mc.week_activity.high_intensity_days|default(0) }}</span>
             <span style="font-size:13px; color:var(--text-secondary);">高强度天</span>
         </div>
+        {% if acwr is defined and acwr %}
+        <div title="ACWR（急慢性负荷比）= 近7天日均TSS ÷ 近28天日均TSS。安全区间 0.8-1.3；>1.3 受伤风险升高；>1.5 极高风险">
+            {% if acwr.acwr is not none %}
+            <span style="font-size:22px; font-weight:700; font-variant-numeric:tabular-nums;
+                color:{% if acwr.level == 'optimal' %}var(--green){% elif acwr.level == 'low' %}var(--blue){% elif acwr.level == 'high' %}var(--orange){% elif acwr.level == 'very_high' %}var(--red){% else %}var(--text-tertiary){% endif %};">{{ '%.2f'|format(acwr.acwr) }}</span>
+            {% else %}
+            <span style="font-size:22px; font-weight:700; color:var(--text-tertiary);">—</span>
+            {% endif %}
+            <span style="font-size:13px; color:var(--text-secondary);">ACWR</span>
+            <span class="pill {% if acwr.level == 'optimal' %}pill-green{% elif acwr.level == 'low' %}pill-blue{% elif acwr.level == 'high' %}pill-orange{% elif acwr.level == 'very_high' %}pill-red{% else %}pill-teal{% endif %}" style="margin-left:4px; font-size:11px;">{{ acwr.status }}</span>
+        </div>
+        {% endif %}
         <div style="font-size:15px; color:var(--text-secondary); letter-spacing:1px;">
             {% for sport, cnt in mc.week_activity.sport_counts.items() %}
-                {% if sport == 'cycling' %}🚴{{ cnt }}{% elif sport == 'running' %}🏃{{ cnt }}{% elif sport == 'training' %}💪{{ cnt }}{% else %}{{ sport }}{{ cnt }}{% endif %}{{ '  ' if not loop.last }}
+                {% if sport == 'running' %}🏃{{ cnt }}{% elif sport == 'training' %}💪{{ cnt }}{% endif %}{{ '  ' if not loop.last }}
             {% endfor %}
         </div>
     </div>
@@ -275,9 +368,18 @@
 
 {# ═══ 模块 4: 训练负荷趋势 ═══ #}
 <div class="card section">
-    <div style="font-size:13px; color:var(--text-secondary); padding:8px 12px; margin-bottom:8px; background:rgba(255,255,255,0.03); border-radius:8px; line-height:1.6;">
-        {% if decision_summary is defined and decision_summary %}{{ decision_summary }}{% else %}&gt; 训练负荷趋势（hover 查看详情）{% endif %}
+    {% set ds = decision_summary %}
+    {% if ds is defined and ds is mapping and ds.today_evidence %}
+    <div style="font-size:13px; color:var(--text-secondary); padding:10px 14px; margin-bottom:8px; background:rgba(255,255,255,0.03); border-radius:8px; line-height:1.7;">
+        <span style="font-weight:600; color:var(--text-primary);">{{ ds.today_title }}</span>
+        <span style="margin:0 6px; color:var(--text-tertiary);">·</span>
+        {{ ds.today_evidence | join(' · ') }}
+        {% if ds.week_status_text %}
+        <span style="margin:0 6px; color:var(--text-tertiary);">·</span>
+        <span>{{ ds.week_status_text }}</span>
+        {% endif %}
     </div>
+    {% endif %}
     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
         <div class="card-label" style="margin:0;">训练负荷趋势</div>
         <div style="display:flex; gap:4px;" id="fitnessRangeBtns">
@@ -302,10 +404,11 @@
                 <th>名称</th>
                 <th>类型</th>
                 <th>时长</th>
-                <th>TSS</th>
-                <th>NP</th>
-                <th>IF</th>
-                <th>漂移</th>
+                <th title="跑步平均配速（分'秒''/km）">配速</th>
+                <th title="TSS（Training Stress Score）— 综合时长×强度的训练量化值">TSS</th>
+                <th>平均心率</th>
+                <th>平均步频</th>
+                <th title="心率漂移 — 稳态训练中心率随时间上升的幅度，> 5% 提示有氧耐力不足或脱水">漂移</th>
                 <th>计划</th>
             </tr>
         </thead>
@@ -315,24 +418,24 @@
                 <td style="white-space:nowrap;">{{ act.date[:10] if act.date else '—' }}</td>
                 <td><a href="/activity/{{ act.id }}">{{ act.name or '未命名' }}</a></td>
                 <td>
-                    {% if act.sport == 'cycling' %}<span class="pill pill-blue">🚴 骑行</span>
-                    {% elif act.sport == 'running' %}<span class="pill pill-green">🏃 跑步</span>
+                    {% if act.sport == 'running' %}<span class="pill pill-green">🏃 跑步</span>
                     {% elif act.sport == 'training' %}<span class="pill pill-purple">💪 力量</span>
                     {% else %}<span class="pill pill-teal">{{ act.sport or '?' }}</span>{% endif %}
                 </td>
                 <td>{{ '%d' % (act.total_timer_s / 60) if act.total_timer_s else '—' }}m</td>
+                <td style="font-weight:600; color:var(--teal); white-space:nowrap;">{{ act.pace_str if act.pace_str else '—' }}</td>
                 <td style="font-weight:600; color:var(--orange);">{{ '%.0f' % act.tss if act.tss else '—' }}</td>
-                <td style="font-weight:600; color:var(--blue);">{{ '%.0f' % act.normalized_power if act.normalized_power else '—' }}</td>
-                <td>{{ '%.2f' % act.intensity_factor if act.intensity_factor else '—' }}</td>
+                <td style="font-weight:600; color:var(--blue);">{{ '%.0f' % act.avg_hr if act.avg_hr else '—' }}</td>
+                <td>{{ '%.0f' % act.avg_cadence if act.avg_cadence else '—' }}</td>
                 <td>
                     {% if act.drift_classification == 'stable' %}<span class="pill pill-green">稳定</span>
                     {% elif act.drift_classification == 'moderate' %}<span class="pill pill-orange">轻度</span>
                     {% elif act.drift_classification == 'high' %}<span class="pill pill-red">偏高</span>
                     {% else %}<span style="color:var(--text-tertiary);">—</span>{% endif %}
                 </td>
-                <td>
-                    {% if act.plan_match is defined and act.plan_match == 'match' %}<span style="color:var(--green);">✅符合</span>
-                    {% elif act.plan_match is defined and act.plan_match == 'deviation' %}<span style="color:var(--orange);">⚠偏差</span>
+                <td style="max-width:120px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
+                    {% if act.plan_title %}<span style="color:var(--green);" title="{{ act.plan_title }}">✅ {{ act.plan_title }}</span>
+                    {% elif act.plan_match is defined and act.plan_match == 'deviation' %}<span style="color:var(--orange);">⚠ 偏差</span>
                     {% else %}<span style="color:var(--text-tertiary);">—</span>{% endif %}
                 </td>
             </tr>
@@ -342,15 +445,6 @@
     </div>
 </div>
 
-{# ═══ PDC (保留) ═══ #}
-{% if pdc_season or pdc_alltime %}
-<div class="card section">
-    <div class="card-label">功率持续曲线 · 90天 vs 历史最佳</div>
-    <div class="chart-wrap">
-        <canvas id="pdcChart"></canvas>
-    </div>
-</div>
-{% endif %}
 
 <div style="padding:20px 0; text-align:center; font-size:12px; color:var(--text-tertiary); border-top:0.5px solid var(--glass-border); margin-top:24px;">
     本系统用于训练管理与运动表现优化，不替代医疗诊断或治疗建议。如存在伤病或异常，请咨询专业医疗人员。
@@ -392,21 +486,21 @@ function renderFitnessChart(days) {
             labels: data.map(d => d.date),
             datasets: [
                 {
-                    label: 'CTL · 体能',
+                    label: 'CTL · 体能（长期训练负荷）',
                     data: data.map(d => d.ctl),
                     borderColor: '#0a84ff',
                     fill: false, tension: 0.4,
                     pointRadius: 0, pointHoverRadius: 5, borderWidth: 2.5,
                 },
                 {
-                    label: 'ATL · 疲劳',
+                    label: 'ATL · 疲劳（近期训练负荷）',
                     data: data.map(d => d.atl),
                     borderColor: '#ff9f0a',
                     fill: false, tension: 0.4,
                     pointRadius: 0, pointHoverRadius: 5, borderWidth: 2.5,
                 },
                 {
-                    label: 'TSB · 状态',
+                    label: 'TSB · 状态（CTL−ATL）',
                     data: data.map(d => d.tsb),
                     borderColor: '#30d158',
                     backgroundColor: ctx => {
@@ -486,56 +580,5 @@ document.querySelectorAll('#fitnessRangeBtns .range-btn').forEach(btn => {
     });
 });
 
-// ── PDC 图（保留原逻辑）──
-const pdcSeason = {{ pdc_season | tojson }};
-const pdcAlltime = {{ pdc_alltime | tojson }};
-
-if ((pdcSeason && pdcSeason.length > 0) || (pdcAlltime && pdcAlltime.length > 0)) {
-    const durationLabels = {
-        1: '1s', 5: '5s', 10: '10s', 15: '15s', 30: '30s',
-        60: '1m', 120: '2m', 300: '5m', 600: '10m',
-        1200: '20m', 2400: '40m', 3600: '1h', 5400: '1.5h', 7200: '2h'
-    };
-    const baseData = pdcAlltime && pdcAlltime.length > 0 ? pdcAlltime : pdcSeason;
-    const labels = baseData.map(d => durationLabels[d.duration_s] || d.duration_s + 's');
-    const seasonMap = {};
-    if (pdcSeason) pdcSeason.forEach(d => { seasonMap[d.duration_s] = d.power; });
-    const datasets = [];
-    if (pdcAlltime && pdcAlltime.length > 0) {
-        datasets.push({
-            label: '历史最佳', data: pdcAlltime.map(d => d.power),
-            borderColor: 'rgba(255,255,255,0.25)',
-            backgroundColor: 'rgba(255,255,255,0.04)',
-            fill: true, tension: 0.4, pointRadius: 2, pointHoverRadius: 5,
-            pointBackgroundColor: 'rgba(255,255,255,0.3)', pointBorderColor: 'transparent',
-            borderWidth: 1.5, borderDash: [4, 3],
-        });
-    }
-    if (pdcSeason && pdcSeason.length > 0) {
-        datasets.push({
-            label: '90天最佳', data: baseData.map(d => seasonMap[d.duration_s] || null),
-            borderColor: '#bf5af2',
-            backgroundColor: 'rgba(191,90,242,0.1)',
-            fill: true, tension: 0.4, pointRadius: 3, pointHoverRadius: 6,
-            pointBackgroundColor: '#bf5af2', pointBorderColor: 'transparent', borderWidth: 2.5,
-        });
-    }
-    new Chart(document.getElementById('pdcChart'), {
-        type: 'line', data: { labels, datasets },
-        options: {
-            responsive: true, maintainAspectRatio: false,
-            interaction: { intersect: false, mode: 'index' },
-            scales: {
-                x: { ticks: { font: { size: 11, weight: '500' } }, grid: { color: gridColor }, border: { display: false } },
-                y: { ticks: { font: { size: 11 } }, grid: { color: gridColor }, border: { display: false },
-                     title: { display: true, text: '瓦特 (W)', font: { size: 12, weight: '500' }, color: 'rgba(245,245,247,0.35)' } }
-            },
-            plugins: {
-                legend: { labels: { font: { size: 12, weight: '500' }, padding: 20, usePointStyle: true, pointStyle: 'circle' } },
-                tooltip: tooltipStyle,
-            }
-        }
-    });
-}
 </script>
 {% endblock %}

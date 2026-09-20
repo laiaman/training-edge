@@ -1,0 +1,119 @@
+{% extends "base.html" %}
+{% block title %}目标与周期 — TrainingEdge{% endblock %}
+{% block content %}
+<style>
+    .goal-layout { display:grid; grid-template-columns:minmax(0, 1fr) minmax(320px, .8fr); gap:16px; margin-top:18px; }
+    .goal-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+    .goal-field { margin-bottom:12px; }
+    .goal-field label { display:block; font-size:12px; color:var(--text-secondary); margin-bottom:5px; }
+    .goal-field input, .goal-field select { width:100%; border:.5px solid var(--glass-border); background:rgba(255,255,255,.06); color:var(--text-primary); border-radius:10px; padding:10px 11px; font:inherit; }
+    .goal-actions { display:flex; justify-content:flex-end; margin-top:8px; }
+    .goal-btn { border:.5px solid var(--glass-border); background:var(--bg-secondary); color:var(--text-primary); border-radius:10px; padding:9px 13px; cursor:pointer; }
+    .goal-btn.primary { background:var(--blue); border-color:var(--blue); color:white; font-weight:600; }
+    .zone-row { display:grid; grid-template-columns:120px 1fr 70px; gap:5px 10px; padding:10px 0; border-bottom:.5px solid var(--separator); font-size:13px; }
+    .zone-code { display:block; color:var(--text-tertiary); font-size:10px; font-weight:500; margin-top:2px; text-transform:uppercase; }
+    .zone-description { grid-column:1 / -1; color:var(--text-tertiary); font-size:11px; line-height:1.5; }
+    .impact { display:none; margin-top:16px; }
+    .impact-item { display:grid; grid-template-columns:24px 130px 1fr; gap:10px; padding:12px 0; border-bottom:.5px solid var(--separator); font-size:13px; }
+    .impact-detail { color:var(--text-secondary); white-space:pre-wrap; word-break:break-word; }
+    .message { display:none; border-radius:9px; padding:10px 12px; margin-top:12px; font-size:13px; }
+    @media(max-width:760px){ .goal-layout{grid-template-columns:1fr}.goal-grid{grid-template-columns:1fr}.impact-item{grid-template-columns:24px 1fr}.impact-detail{grid-column:2} }
+</style>
+
+<div class="page-header">
+    <h1>目标与周期</h1>
+    <div class="subtitle">这里只生成影响预览；确认选中项后才写入 Revision {{ plan_revision + 1 }}。</div>
+</div>
+
+<div class="goal-layout">
+    <section class="card">
+        <div class="card-label">目标草案</div>
+        <div class="goal-grid">
+            <div class="goal-field"><label>主目标赛事</label><input id="primaryRace" value="{{ goal.primary_race }}"></div>
+            <div class="goal-field"><label>主赛日期</label><input id="primaryRaceDate" type="date" value="{{ goal.primary_race_date }}"></div>
+            <div class="goal-field"><label>A 目标时间</label><input id="aTarget" value="{{ goal.a_target_time }}" placeholder="02:55:00"></div>
+            <div class="goal-field"><label>B 目标时间</label><input id="bTarget" value="{{ goal.b_target_time }}" placeholder="02:58:00"></div>
+            <div class="goal-field"><label>备选赛事</label><input id="secondaryRace" value="{{ goal.secondary_race }}"></div>
+            <div class="goal-field"><label>备选赛日期</label><input id="secondaryRaceDate" type="date" value="{{ goal.secondary_race_date }}"></div>
+            <div class="goal-field"><label>优先级</label><select id="priority"><option value="A" {% if goal.priority == 'A' %}selected{% endif %}>A</option><option value="B" {% if goal.priority == 'B' %}selected{% endif %}>B</option></select></div>
+        </div>
+        <div class="goal-actions"><button class="goal-btn primary" onclick="previewImpact()">生成影响预览</button></div>
+        <div id="message" class="message"></div>
+    </section>
+
+    <aside class="card">
+        <div class="card-label">当前配速区间</div>
+        {% for key, zone in pace_zones.items() %}
+        {% set zone_meta = pace_zone_descriptions.get(key, {'label': key, 'description': ''}) %}
+        <div class="zone-row">
+            <strong>{{ zone_meta.label }}<span class="zone-code">{{ key }}</span></strong>
+            <span>{{ zone.pace }}/km</span><span>RPE {{ zone.rpe }}</span>
+            {% if zone_meta.description %}<div class="zone-description">{{ zone_meta.description }}</div>{% endif %}
+        </div>
+        {% endfor %}
+        <div style="font-size:12px;color:var(--text-tertiary);line-height:1.6;margin-top:14px;">目标变化会分别产生赛事目标、配速区间、周期分期和未来课表四类变更，可逐项接受。</div>
+    </aside>
+</div>
+
+<section id="impactPanel" class="card impact">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;">
+        <div><strong>待确认计划变更</strong><div style="font-size:12px;color:var(--text-secondary);margin-top:3px;">未勾选的部分保持原样。</div></div>
+        <button class="goal-btn primary" onclick="applyImpact()">应用已选变更</button>
+    </div>
+    <div id="impactItems"></div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const planRevision = {{ plan_revision }};
+let activeProposalId = null;
+
+function showMessage(text, error=false) {
+    const node = document.getElementById('message');
+    node.style.display = 'block';
+    node.style.background = error ? 'rgba(255,69,58,.12)' : 'rgba(10,132,255,.12)';
+    node.style.color = error ? 'var(--red)' : 'var(--blue)';
+    node.textContent = text;
+}
+
+async function previewImpact() {
+    showMessage('正在计算目标变化对配速、周期和未来课表的影响…');
+    const payload = {expected_revision: planRevision, goal: {
+        primary_race: document.getElementById('primaryRace').value.trim(),
+        primary_race_date: document.getElementById('primaryRaceDate').value,
+        secondary_race: document.getElementById('secondaryRace').value.trim(),
+        secondary_race_date: document.getElementById('secondaryRaceDate').value,
+        a_target_time: document.getElementById('aTarget').value.trim(),
+        b_target_time: document.getElementById('bTarget').value.trim(),
+        priority: document.getElementById('priority').value,
+    }};
+    try {
+        const response = await fetch('/api/goal-impact-proposals', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || '预览失败');
+        activeProposalId = result.proposal_id;
+        document.getElementById('impactItems').innerHTML = result.changes.map((change, index) => `
+            <label class="impact-item"><input type="checkbox" data-index="${index}" checked><strong>${change.label}</strong><span class="impact-detail">${escapeHtml(JSON.stringify(change.after, null, 2))}</span></label>
+        `).join('');
+        document.getElementById('impactPanel').style.display = 'block';
+        showMessage('影响预览已生成，计划尚未修改。');
+    } catch (error) { showMessage(error.message, true); }
+}
+
+async function applyImpact() {
+    const selected = [...document.querySelectorAll('#impactItems input:checked')].map(node => Number(node.dataset.index));
+    if (!selected.length) return showMessage('请至少勾选一项变更。', true);
+    try {
+        const response = await fetch(`/api/plan-proposals/${activeProposalId}/apply`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({selected})});
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || '应用失败');
+        window.location.reload();
+    } catch (error) { showMessage(error.message, true); }
+}
+
+function escapeHtml(value) {
+    return value.replace(/[&<>'"]/g, character => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[character]));
+}
+</script>
+{% endblock %}
